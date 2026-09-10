@@ -269,7 +269,6 @@ stdenv.mkDerivation {
   '';
 
   passthru = {
-    inherit bunDeps;
     nativeAddon = platform.addon;
   };
 
