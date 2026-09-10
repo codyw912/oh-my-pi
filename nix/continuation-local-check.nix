@@ -111,6 +111,7 @@ stdenv.mkDerivation {
 
     # Probe before any OMP import. bun install (hook) does not import OMP.
     bun -- ${lib.escapeShellArg probeRel}
+    bun run gen:tool-views
 
     bun test -- ${lib.concatMapStringsSep " " lib.escapeShellArg testFiles}
 
