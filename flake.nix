@@ -37,6 +37,13 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Pinned Sjujperpowers baseline plus the deployed onboarding patch applied
+    # in checks. Never an ambient checkout.
+    sjujperpowers = {
+      url = "github:codyw912/sjujperpowers/fb3395eb3e2e9808fc516fe5d537f5b42a737b2d";
+      flake = false;
+    };
   };
 
   outputs =
@@ -48,6 +55,7 @@
       nixpkgs,
       nixpkgs-darwin-x64,
       rust-overlay,
+      sjujperpowers,
       ...
     }:
     let
@@ -117,6 +125,7 @@
         system:
         let
           pkgs = pkgsFor system;
+          inherit (pkgs) lib;
           homeManagerEvaluation = pkgs.lib.evalModules {
             specialArgs = { inherit pkgs; };
             modules = [
@@ -156,6 +165,56 @@
             assert builtins.elem self.packages.${system}.default
               nixosEvaluation.config.environment.systemPackages;
             pkgs.runCommand "omp-module-evaluation" { } "touch $out";
+          sjujperpowersRev = "fb3395eb3e2e9808fc516fe5d537f5b42a737b2d";
+          continuationLinuxChecks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+            let
+              patchedSjujperpowers = pkgs.applyPatches {
+                name = "sjujperpowers-onboarding";
+                src = sjujperpowers;
+                patches = [ ./nix/patches/sjujperpowers-backend-onboarding.patch ];
+              };
+              continuationCheck =
+                args:
+                pkgs.callPackage ./nix/continuation-local-check.nix (
+                  {
+                    omp = self.packages.${system}.default;
+                    source = self.outPath;
+                    sjujperpowersSource = patchedSjujperpowers;
+                    sourceRev = self.rev or self.dirtyRev or "dirty";
+                    inherit sjujperpowersRev;
+                  }
+                  // args
+                );
+            in
+            {
+              continuation-baseline = continuationCheck {
+                pname = "omp-continuation-baseline";
+                runBaseline = true;
+                testFiles = [
+                  "packages/utils/test/file-lock.test.ts"
+                  "packages/natives/test/file-lock.test.ts"
+                  "packages/coding-agent/test/session-storage.test.ts"
+                  "packages/coding-agent/test/agent-session-new-session-boundary.test.ts"
+                  "packages/coding-agent/test/session-manager/new-session-boundary.test.ts"
+                ];
+              };
+            }
+            // lib.optionalAttrs (
+              builtins.pathExists ./packages/coding-agent/test/agent-session-continuation.test.ts
+            ) {
+              continuation-handoff = continuationCheck {
+                pname = "omp-continuation-handoff";
+                testFiles = [ "packages/coding-agent/test/agent-session-continuation.test.ts" ];
+              };
+            }
+            // lib.optionalAttrs (builtins.pathExists ./packages/coding-agent/test/continuation-local.test.ts)
+              {
+                continuation-local = continuationCheck {
+                  pname = "omp-continuation-local";
+                  testFiles = [ "packages/coding-agent/test/continuation-local.test.ts" ];
+                };
+              }
+          );
         in
         {
           bun-lock = pkgs.runCommand "omp-bun-lock" { nativeBuildInputs = [ pkgs.bun2nix ]; } ''
@@ -171,6 +230,7 @@
           modules = modulesEvaluate;
           omp = self.packages.${system}.default;
         }
+        // continuationLinuxChecks
       );
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt);

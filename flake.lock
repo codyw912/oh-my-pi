@@ -147,7 +147,8 @@
         "nix-bun": "nix-bun",
         "nixpkgs": "nixpkgs",
         "nixpkgs-darwin-x64": "nixpkgs-darwin-x64",
-        "rust-overlay": "rust-overlay"
+        "rust-overlay": "rust-overlay",
+        "sjujperpowers": "sjujperpowers"
       }
     },
     "rust-overlay": {
@@ -167,6 +168,23 @@
       "original": {
         "owner": "oxalica",
         "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "sjujperpowers": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788404278,
+        "narHash": "sha256-ZShJBDMXGoXE0jdZO9t79w0wsUSGslaS2jYO+15P0tA=",
+        "owner": "codyw912",
+        "repo": "sjujperpowers",
+        "rev": "fb3395eb3e2e9808fc516fe5d537f5b42a737b2d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "codyw912",
+        "repo": "sjujperpowers",
+        "rev": "fb3395eb3e2e9808fc516fe5d537f5b42a737b2d",
         "type": "github"
       }
     },

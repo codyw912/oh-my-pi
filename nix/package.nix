@@ -177,6 +177,8 @@ stdenv.mkDerivation {
     install -Dm755 packages/coding-agent/dist/omp "$out/bin/omp"
     install -Dm644 LICENSE "$out/share/doc/omp/LICENSE"
     install -Dm644 THIRD-PARTY-NOTICES.txt "$out/share/doc/omp/THIRD-PARTY-NOTICES.txt"
+    install -Dm755 "packages/natives/native/${platform.addon}" \
+      "$out/lib/pi-natives/${platform.addon}"
 
     # The addon is gzip-compressed inside the compiled binary, so the store
     # paths it links against are invisible to the output reference scanner.
@@ -265,6 +267,11 @@ stdenv.mkDerivation {
     ''}
     runHook postInstallCheck
   '';
+
+  passthru = {
+    inherit bunDeps;
+    nativeAddon = platform.addon;
+  };
 
   meta = {
     description = "Terminal-based coding agent with multi-model support";

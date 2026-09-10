@@ -1,0 +1,777 @@
+diff --git a/.omp/extensions/sjujperpowers.ts b/.omp/extensions/sjujperpowers.ts
+index d976513..4b2d5b5 100644
+--- a/.omp/extensions/sjujperpowers.ts
++++ b/.omp/extensions/sjujperpowers.ts
+@@ -1,12 +1,59 @@
+-import { dirname, resolve } from "node:path";
++import { existsSync } from "node:fs";
++import { dirname, join, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+ 
+ const extensionDir = dirname(fileURLToPath(import.meta.url));
+ const skillsDir = resolve(extensionDir, "../../skills");
++const BACKEND_SETUP_NOTICE =
++	"This primary interactive session is in a version-controlled repository without " +
++	"`.sjujperpowers/config.json`. Before changing roadmap/spec/plan artifacts or starting a change, " +
++	"invoke `skill://setting-up-tracking-providers` and let the operator choose the roadmap and execution " +
++	"backends. Do not silently accept the file-roadmap/session-todo defaults on first use.";
++const JUJUTSU_SETUP_NOTICE =
++	"This primary interactive session is in a Git repository without Jujutsu metadata. " +
++	"This isn't a jj repo. Run `jj git init --colocate` and re-run, or tell me to continue without VCS steps. " +
++	"After resolving that choice, invoke `skill://setting-up-tracking-providers`; never pass an empty `jj root` result.";
++
++export function findRepositoryRoot(start: string): string | undefined {
++	let current = resolve(start);
++	while (true) {
++		if (existsSync(join(current, ".jj")) || existsSync(join(current, ".git"))) return current;
++		const parent = dirname(current);
++		if (parent === current) return undefined;
++		current = parent;
++	}
++}
++
++export function needsBackendSetup(cwd: string): boolean {
++	const root = findRepositoryRoot(cwd);
++	return root !== undefined && !existsSync(join(root, ".sjujperpowers/config.json"));
++}
+ 
+ export default function sjujperpowersOmpExtension(omp: ExtensionAPI) {
++	let backendSetupPending = false;
++	let backendSetupNotice = BACKEND_SETUP_NOTICE;
++	const refreshBackendSetup = (_event: unknown, ctx: { cwd: string; hasUI: boolean }) => {
++		const root = ctx.hasUI ? findRepositoryRoot(ctx.cwd) : undefined;
++		backendSetupPending = root !== undefined && !existsSync(join(root, ".sjujperpowers/config.json"));
++		backendSetupNotice =
++			root !== undefined && !existsSync(join(root, ".jj")) ? JUJUTSU_SETUP_NOTICE : BACKEND_SETUP_NOTICE;
++	};
++
+ 	omp.on("resources_discover", async () => ({
+ 		skillPaths: [skillsDir],
+ 	}));
++	omp.on("session_start", refreshBackendSetup);
++	omp.on("session_switch", refreshBackendSetup);
++	omp.on("before_agent_start", async () => {
++		if (!backendSetupPending) return;
++		backendSetupPending = false;
++		return {
++			message: {
++				customType: "sjujperpowers-backend-setup",
++				content: backendSetupNotice,
++				display: false,
++			},
++		};
++	});
+ }
+diff --git a/skills/setting-up-tracking-providers/SKILL.md b/skills/setting-up-tracking-providers/SKILL.md
+new file mode 100644
+index 0000000..e08320a
+--- /dev/null
++++ b/skills/setting-up-tracking-providers/SKILL.md
+@@ -0,0 +1,151 @@
++---
++name: setting-up-tracking-providers
++description: Use in a primary interactive session when a version-controlled repository first uses Sjujperpowers without .sjujperpowers/config.json, or when the user asks to configure Plane, file-roadmap, Kata, or session tracking backends.
++---
++
++# Setting Up Tracking Providers
++
++## Scope
++
++Run this once per repository before the first roadmap, spec, plan, issue, or
++Jujutsu mutation. Do not run it in subagents or non-interactive jobs. Do not
++silently accept the default `file + session` combination on first interactive
++use: those defaults remain valid, but the operator must choose them knowingly.
++
++This skill configures provider references and verifies access. Agents reuse an
++existing Plane project when one fits or create a standalone project directly
++with the standard feature profile. Project visibility is not an onboarding gate.
++
++## 1. Inspect before asking
++
++Run `jj root`. If it fails, stop:
++
++> This isn't a jj repo. Run `jj git init --colocate` and re-run, or tell me to continue without VCS steps.
++
++Never invoke the resolver with an empty `--root` value. After the operator
++initializes the colocated repository, set `root="$(jj root)"`. If the operator
++instead explicitly chooses to continue without VCS steps, set
++`root="$(git rev-parse --show-toplevel)"` and skip all Jujutsu operations.
++
++Resolve the current provider state with that explicit root:
++
++```bash
++node <tracking-providers skill dir>/scripts/resolve-config.mjs \
++  --root "$root"
++```
++
++If `configPath` is non-null, report the resolved providers and stop unless the
++operator explicitly asked to reconfigure them.
++
++When no configuration exists, inspect before asking:
++
++1. Existing project documentation and established docs root.
++2. Available Plane projects through a mounted Plane tool or the constrained
++   `plane-api` command.
++3. `kata health --json` and `kata projects list --json`.
++4. Repository landing convention: local landing or pull request.
++
++Never request, read, print, or persist a credential. A missing Plane tool,
++missing non-secret placeholder, or `401`/`403` means Plane is unavailable in
++this agent environment; report that boundary instead of silently choosing a
++different provider.
++
++## 2. Ask only for real provider decisions
++
++Ask the operator for the choices that inspection cannot determine:
++
++- Roadmap: `plane`, `file`, or `none`.
++- Execution: `kata`, `session`, or `none`.
++- Completion boundary for Kata: `landed` or `pull_request`.
++- Existing Plane product/platform project when one fits; otherwise the agent creates a standalone project.
++- Kata project name when no matching project exists.
++
++Infer `docsRoot` from repository convention. Ask only when multiple established
++locations are plausible. Plane and Kata are independent; never imply that one
++requires the other.
++
++## 3. Preflight selected backends
++
++For Plane, make a harmless authenticated project-list request through the
++available Plane tool or:
++
++```bash
++plane-api GET '/api/v1/workspaces/<workspace>/projects/?per_page=100'
++```
++
++If the operator selected Plane and this preflight reports missing access, use
++the environment's credential-provisioning skill to give the operator scoped
++hidden-entry commands, then stop. Resume setup only after the operator reports
++that access is active.
++
++Reuse an existing Plane project when the repository belongs to that product or
++platform. For a standalone product with no match, infer a concise project name
++and uppercase identifier from repository context. Ask only when either value is
++ambiguous or conflicts with an existing project. Otherwise create it directly:
++
++```bash
++name='PROJECT NAME'
++identifier='IDENTIFIER'
++plane-api POST "/api/v1/workspaces/<workspace>/projects/" \
++  "$(jq -cn \
++    --arg name "$name" \
++    --arg identifier "$identifier" \
++    '{name:$name, identifier:$identifier, module_view:true,
++      cycle_view:false, issue_views_view:true, page_view:true,
++      intake_view:true}')"
++```
++
++This standard profile enables modules, views, pages, and intake while leaving
++cycles disabled. Separate MCP feature routes return 404, but Plane `1.4.2`
++accepts these fields in its project create and update serializers. Use Plane's
++default visibility; Secret visibility is not required. Retrieve the created
++project and continue without delegating UI setup to the operator.
++
++For Kata:
++
++```bash
++kata health --json
++kata projects show <project> --json
++```
++
++If the selected project does not exist, create it once and then resolve it:
++
++```bash
++kata projects create <project> --json
++kata projects show <project> --json
++```
++
++Do not write `.sjujperpowers/config.json` until every selected runtime backend
++passes its preflight.
++
++## 4. Persist one validated configuration
++
++Run the configurator from this skill directory. Example:
++
++```bash
++node <setting-up-tracking-providers skill dir>/scripts/configure-providers.mjs \
++  --root "$root" \
++  --docs-root docs/project \
++  --roadmap plane \
++  --roadmap-project 'Example Product' \
++  --execution kata \
++  --execution-project example-product \
++  --completion landed
++```
++
++Use `--overwrite` only after showing the existing resolved configuration and
++receiving an explicit reconfiguration request. The command validates the
++closed schema, preflights Kata when selected, and atomically writes the file.
++
++## 5. Verify and continue
++
++Run checked resolution again:
++
++```bash
++node <tracking-providers skill dir>/scripts/resolve-config.mjs \
++  --root "$root"
++```
++
++Report the roadmap provider, execution provider, docs root, and completion
++boundary. Then return to the lifecycle skill that triggered setup. The new
++configuration is versioned project policy and belongs in that change.
+diff --git a/skills/setting-up-tracking-providers/scripts/configure-providers.mjs b/skills/setting-up-tracking-providers/scripts/configure-providers.mjs
+new file mode 100755
+index 0000000..8a7e148
+--- /dev/null
++++ b/skills/setting-up-tracking-providers/scripts/configure-providers.mjs
+@@ -0,0 +1,154 @@
++#!/usr/bin/env node
++
++import { realpathSync } from 'node:fs';
++import { access, mkdir, rename, rm, writeFile } from 'node:fs/promises';
++import { dirname, resolve } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { normalizeConfig, preflightKata } from '../../tracking-providers/scripts/resolve-config.mjs';
++
++class CliUsageError extends Error {}
++
++export async function configureProviders(
++  root,
++  raw,
++  { overwrite = false, preflightKataFn = preflightKata } = {},
++) {
++  const configPath = resolve(root, '.sjujperpowers/config.json');
++  const config = normalizeConfig(raw, configPath);
++
++  if (config.execution.provider === 'kata') {
++    await preflightKataFn(config.execution.project, { configPath });
++  }
++
++  if (!overwrite) {
++    try {
++      await access(configPath);
++      throw new Error(`${configPath} already exists; pass --overwrite to replace it`);
++    } catch (error) {
++      if (error.code !== 'ENOENT') throw error;
++    }
++  }
++
++  await mkdir(dirname(configPath), { recursive: true });
++  const temporaryPath = `${configPath}.tmp-${process.pid}`;
++  try {
++    const persisted = {
++      version: config.version,
++      docsRoot: config.docsRoot,
++      roadmap: config.roadmap,
++      execution: config.execution,
++    };
++    await writeFile(temporaryPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o644 });
++    await rename(temporaryPath, configPath);
++  } catch (error) {
++    await rm(temporaryPath, { force: true });
++    throw error;
++  }
++
++  return config;
++}
++
++function takeValue(args, index, option) {
++  const value = args[index + 1];
++  if (!value) throw new CliUsageError(`${option} requires a value`);
++  return value;
++}
++
++function parseArgs(args) {
++  const values = {
++    root: process.cwd(),
++    docsRoot: 'docs/project',
++    completion: 'landed',
++    overwrite: false,
++  };
++
++  for (let index = 0; index < args.length; index += 1) {
++    const option = args[index];
++    if (option === '--overwrite') {
++      values.overwrite = true;
++      continue;
++    }
++    if (option === '--help' || option === '-h') {
++      values.help = true;
++      continue;
++    }
++
++    const value = takeValue(args, index, option);
++    index += 1;
++    switch (option) {
++      case '--root':
++        values.root = resolve(value);
++        break;
++      case '--docs-root':
++        values.docsRoot = value;
++        break;
++      case '--roadmap':
++        values.roadmap = value;
++        break;
++      case '--roadmap-project':
++        values.roadmapProject = value;
++        break;
++      case '--execution':
++        values.execution = value;
++        break;
++      case '--execution-project':
++        values.executionProject = value;
++        break;
++      case '--completion':
++        values.completion = value;
++        break;
++      default:
++        throw new CliUsageError(`unknown option: ${option}`);
++    }
++  }
++
++  return values;
++}
++
++function usage() {
++  return `Usage: configure-providers.mjs [options]\n\n` +
++    `  --root DIR                    Repository root (default: cwd)\n` +
++    `  --docs-root DIR               Versioned project docs root (default: docs/project)\n` +
++    `  --roadmap file|plane|none\n` +
++    `  --roadmap-project NAME        Required for Plane\n` +
++    `  --execution session|kata|none\n` +
++    `  --execution-project NAME      Required for Kata\n` +
++    `  --completion landed|pull_request\n` +
++    `  --overwrite                   Replace an existing configuration\n`;
++}
++
++async function main() {
++  try {
++    const options = parseArgs(process.argv.slice(2));
++    if (options.help) {
++      process.stdout.write(usage());
++      return;
++    }
++    if (!options.roadmap) throw new CliUsageError('--roadmap is required');
++    if (!options.execution) throw new CliUsageError('--execution is required');
++
++    const roadmap = { provider: options.roadmap };
++    if (options.roadmapProject !== undefined) roadmap.project = options.roadmapProject;
++    const execution = { provider: options.execution, completion: options.completion };
++    if (options.executionProject !== undefined) execution.project = options.executionProject;
++
++    const config = await configureProviders(
++      options.root,
++      {
++        version: 1,
++        docsRoot: options.docsRoot,
++        roadmap,
++        execution,
++      },
++      { overwrite: options.overwrite },
++    );
++    process.stdout.write(`${JSON.stringify(config)}\n`);
++  } catch (error) {
++    process.stderr.write(`${error.message}\n`);
++    process.exitCode = error instanceof CliUsageError ? 2 : 1;
++  }
++}
++
++if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))) {
++  await main();
++}
+diff --git a/skills/brainstorming/SKILL.md b/skills/brainstorming/SKILL.md
+--- a/skills/brainstorming/SKILL.md
++++ b/skills/brainstorming/SKILL.md
+@@ -98,3 +98,3 @@ For architectural work, use `docsRoot` from the checked provider configuration
+ **Architectural:**
+-1. **Explore project context** — check files, docs, recent commits. Resolve the roadmap and execution providers first. For `file`, read `docs/project/roadmap.md` when present and state the milestone; if none fits, Revise first or proceed as `Milestone: none (unplanned)` with a Decisions line. For `plane`, require and state an existing `plane:<identifier>` outcome without editing the file roadmap. For `none`, state the explicit no-roadmap source. If the file provider has no roadmap AND the request is a new project, invoke roadmapping before continuing.
++1. **Explore project context** — check files, docs, recent commits. Resolve the roadmap and execution providers first. For `file`, read `docs/project/roadmap.md` when present and state the milestone; if none fits, Revise first or proceed as `Milestone: none (unplanned)` with a Decisions line. For `plane`, inspect the configured project and reuse a matching outcome when one exists; if none exists, record that a new outcome is needed but do not create it during context exploration. For `none`, state the explicit no-roadmap source. If the file provider has no roadmap AND the request is a new project, invoke roadmapping before continuing.
+ 2. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
+@@ -102,3 +102,3 @@ For architectural work, use `docsRoot` from the checked provider configuration
+ 4. **Present design** — in sections scaled to their complexity, get user approval after each section
+-5. **Write design doc** — save to `docs/project/specs/YYYY-MM-DD-<topic>-design.md`
++5. **Write design doc** — after design approval, for `plane` invoke the Plane roadmapping path to create or reuse the outcome using the agreed scope and acceptance criteria, then save to `docs/project/specs/YYYY-MM-DD-<topic>-design.md`
+ 6. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below), then commit the spec by fileset
+diff --git a/skills/finishing-a-change-stack/SKILL.md b/skills/finishing-a-change-stack/SKILL.md
+--- a/skills/finishing-a-change-stack/SKILL.md
++++ b/skills/finishing-a-change-stack/SKILL.md
+@@ -42,3 +42,5 @@ For the `file` provider, use `docsRoot` from the normalized configuration for th
+ - `file`: if `docs/project/roadmap.md` is absent, skip. Otherwise ensure the plan path appears under its source milestone. If that milestone's `**Done when:**` is satisfied, set `**Status:** done` and ask one question whether the next planned milestone is still correct.
+-- `plane`: do not edit the file roadmap or mutate Plane. Prepare a curated roll-up containing accepted scope, issue refs, verification, and the eventual completion result.
++- `plane`: retrieve the referenced outcome and prepare a concise roll-up containing
++  accepted scope, issue refs, verification, and the eventual completion result.
++  Do not edit the file roadmap or mark the Plane outcome complete before landing.
+ - `none`: skip roadmap mutation.
+@@ -154,3 +156,8 @@ Use the exact Kata close contract:
+ For pull-request completion, replace `--commit` with `--pr <url>` when a stable final commit is not available. Never close or claim the `sjujperpowers-plan` parent while a child blocker or local acceptance criterion remains open.
+-For Plane, render one curated roll-up after the action and Kata finalization. Do not apply it or close the external outcome automatically.
++For Plane, after the action and Kata finalization, post the roll-up as a Plane
++comment through the mounted MCP tools. If the referenced outcome's acceptance
++criteria are satisfied, resolve the project's completed state and transition the
++work item to Done. For keep-as-is, failed landing/publication, confirmed discard,
++or unmet acceptance criteria, comment with the exact result and leave the
++outcome open.
+ 
+diff --git a/skills/roadmapping/SKILL.md b/skills/roadmapping/SKILL.md
+--- a/skills/roadmapping/SKILL.md
++++ b/skills/roadmapping/SKILL.md
+@@ -8,5 +8,5 @@
+ ## Overview
+ 
+-Roadmapping orients work to the configured outcome authority. The default `file` provider uses `docs/project/roadmap.md`; `plane` carries an existing external outcome reference without editing a local roadmap; `none` intentionally skips persistent roadmap state. Milestones and external outcomes are results, not tickets. Hierarchy: roadmap source → spec → plan → task.
++Roadmapping orients work to the configured outcome authority. The default `file` provider uses `docs/project/roadmap.md`; `plane` uses the configured project as an active shared outcome authority without editing a local roadmap; `none` intentionally skips persistent roadmap state. Milestones and external outcomes are results, not tickets. Hierarchy: roadmap source → spec → plan → task.
+ 
+ **Announce at start:** "I'm using the roadmapping skill to [create | revise | orient] the project roadmap."
+@@ -60,8 +60,23 @@ Read the file. Report in ≤10 lines: the active milestone, its done-when, open qu
+ ### Plane
+ 
+-Require an existing provider-qualified outcome such as `plane:PROJ-12`. Plane support is reference-based: never claim to create, edit, or close the work item. Do not create or update `docs/project/roadmap.md`.
+-
+-Orient by reporting the supplied outcome reference, the configured Plane project, known acceptance context, and the next spec. If the request needs a new or revised outcome, explain that it must be changed in Plane and stop until an existing reference is available.
+-
+-On Plane editions without Initiatives, use modules for focused initiatives and linked work items for cross-project efforts. Never assume the Initiatives feature exists.
++Use the mounted Plane MCP tools as the roadmap authority. Do not create or
++update `docs/project/roadmap.md`.
++
++For `create`, inspect the configured project's work items and reuse a matching
++outcome when one exists. Otherwise create the durable outcome in that project
++with a clear title, acceptance-focused description, and justified priority.
++
++For `revise`, retrieve the referenced outcome, update only the fields required
++by the decision, and add a concise comment when the reason is not self-evident.
++
++For `orient`, inspect relevant open outcomes and report the exact
++`plane:PROJ-12` reference, current state, priority, acceptance context, blockers,
++and next spec. Offer to continue from the highest-priority ready outcome.
++
++Routine outcome creation and maintenance inside the approved project do not
++require separate operator approval. Stop only for missing Plane access, a new
++project boundary, a destructive operation, or a genuine product decision.
++
++On Plane editions without Initiatives, use modules for focused initiatives and
++linked work items for cross-project efforts. Never assume Initiatives exist.
+ 
+diff --git a/skills/tracking-providers/SKILL.md b/skills/tracking-providers/SKILL.md
+index f9af637..d6c0126 100644
+--- a/skills/tracking-providers/SKILL.md
++++ b/skills/tracking-providers/SKILL.md
+@@ -45,6 +45,13 @@ Credentials, service URLs, daemon addresses, and machine-specific paths belong i
+ 
+ `docsRoot` selects the repository-relative directory for the file roadmap, specs, and plans. It defaults to `docs/project`; set it to another repository-relative directory when the project has an established documentation layout. Trailing slashes are normalized away. Absolute or drive-qualified paths, backslashes, internal empty segments, and `.` or `..` segments are invalid.
+ 
++In a primary interactive session, a missing file is an onboarding state. Invoke
++`sjujperpowers:setting-up-tracking-providers` and let the operator choose before
++the first roadmap, spec, plan, issue, or Jujutsu mutation. A primary choice of
++`file + session` is persisted explicitly so later sessions remain quiet. Only
++subagents and non-interactive jobs use the backward-compatible implicit
++defaults below.
++
+ No file means:
+ 
+ ```json
+@@ -59,7 +66,7 @@ No file means:
+ Supported roadmap providers:
+ 
+ - `file` — `docs/project/roadmap.md` owns outcomes.
+-- `plane` — an existing `plane:<identifier>` owns the outcome; integration is reference-only.
++- `plane` — the configured Plane project is an active shared backlog that agents and the operator both maintain.
+ - `none` — no persistent roadmap authority.
+ 
+ `linear` is reserved but unsupported. Do not accept it as configuration until a real provider exists.
+@@ -82,6 +89,9 @@ node <tracking-providers skill dir>/scripts/resolve-config.mjs \
+ ```
+ 
+ The command prints one normalized JSON object, including `docsRoot`. Skills branch on that output; they never parse the committed JSON independently. Every `docs/project` path below is the default: substitute the checked `docsRoot` value when configured.
++If the normalized result has `configPath: null` in a primary interactive
++session, stop and invoke `sjujperpowers:setting-up-tracking-providers` before
++mutation. Do not treat the defaults as an implicit provider choice.
+ 
+ When execution is `kata`, checked resolution verifies, in order:
+ 
+@@ -137,9 +147,26 @@ Recover a named plan's mapping in a fresh session with:
+ Sort the returned issues numerically by `metadata["sjujperpowers.task"]`. Reconcile that list with the execution or SDD recovery ledger and supply the lowest-numbered child not marked complete to starting-a-change. Open completed children intentionally remain open until the configured landing or publication milestone, so open-state alone cannot identify the next task. Project-wide `kata next` is only for work without a named plan.
+ 
+-## Plane edition compatibility
+-
+-Plane support is reference-based: do not claim to create, update, or close remote work automatically. A human or a separately authorized integration applies curated roll-ups.
+-
+-Use modules to group focused initiatives on Plane editions without Initiatives. Coordinate cross-project efforts with linked work items in each participating project rather than assuming a paid or unavailable Initiative feature.
++## Plane shared backlog
++
++Plane is an active shared backlog. When Plane is configured, agents and the
++operator both read and maintain the configured project through the mounted
++Plane MCP tools.
++
++For requested work in a configured Plane project:
++
++1. Inspect relevant open work items before proposing or starting durable work.
++2. Reuse a matching outcome, or create one when the requested work needs
++   cross-session tracking. Agents do not need separate approval for work items
++   inside an already-approved project boundary.
++3. Keep the state, priority, description, links, blockers, and concise progress
++   or verification comments current as the work changes.
++4. Move the work item to Done when its outcome is satisfied; do not leave
++   completed work for the operator to reconcile.
++
++Do not mirror every numbered versioned-plan step or Kata child into Plane.
++Plane owns durable outcomes and product priority; Kata owns granular execution
++tasks. Both are active systems and the agent maintains each at its authority
++boundary. Use modules to group focused initiatives on Plane editions without
++Initiatives, and use linked work items for cross-project efforts.
+ 
+ ## Completion boundary
+diff --git a/skills/using-sjujperpowers/SKILL.md b/skills/using-sjujperpowers/SKILL.md
+index cd274f0..b8be150 100644
+--- a/skills/using-sjujperpowers/SKILL.md
++++ b/skills/using-sjujperpowers/SKILL.md
+@@ -23,7 +23,7 @@ This is not negotiable. You cannot rationalize your way out of this.
+ 
+ Then announce "Using [skill] to [purpose]" and follow the skill exactly. If it has a checklist, create a todo per item.
+ 
+-For roadmap, spec, plan, or execution lifecycle work, the selected process skill invokes `sjujperpowers:tracking-providers` and resolves `.sjujperpowers/config.json` before versioned or issue mutation. No configuration preserves the existing file-roadmap and session-todo workflow.
++For roadmap, spec, plan, or execution lifecycle work, the selected process skill invokes `sjujperpowers:tracking-providers` and resolves `.sjujperpowers/config.json` before versioned or issue mutation. In a primary interactive repository, missing configuration requires `sjujperpowers:setting-up-tracking-providers` before the first lifecycle mutation; choosing `file + session` still writes explicit project policy so later sessions remain quiet. Only subagents and non-interactive jobs use the backward-compatible implicit defaults.
+ 
+ ## Skill Priority
+ 
+diff --git a/tests/omp/test-omp-extension.mjs b/tests/omp/test-omp-extension.mjs
+index 5e1e6ef..9bb8ce6 100644
+--- a/tests/omp/test-omp-extension.mjs
++++ b/tests/omp/test-omp-extension.mjs
+@@ -1,6 +1,7 @@
+ import assert from 'node:assert/strict';
+-import { readFile } from 'node:fs/promises';
+-import { dirname, resolve } from 'node:path';
++import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { dirname, join, resolve } from 'node:path';
++import { tmpdir } from 'node:os';
+ import { fileURLToPath, pathToFileURL } from 'node:url';
+ import test from 'node:test';
+ 
+@@ -32,14 +33,50 @@ test('package declares a separate OMP extension', async () => {
+   assert.deepEqual(pkg.pi.extensions, ['./.pi/extensions/sjujperpowers.ts']);
+ });
+ 
+-test('OMP extension discovers skills without bootstrap hooks', async () => {
++test('OMP extension discovers skills and prompts once for missing backend configuration', async t => {
+   const handlers = await loadExtension();
+ 
+-  assert.deepEqual([...handlers.keys()], ['resources_discover']);
++  assert.deepEqual(
++    [...handlers.keys()],
++    ['resources_discover', 'session_start', 'session_switch', 'before_agent_start'],
++  );
+   const [discover] = handlers.get('resources_discover');
+   const result = await discover({ type: 'resources_discover', cwd: repoRoot, reason: 'startup' }, {});
+-
+   assert.deepEqual(result.skillPaths, [resolve(repoRoot, 'skills')]);
++
++  const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-omp-onboarding-'));
++  t.after(() => rm(root, { recursive: true, force: true }));
++  const nested = join(root, 'src');
++  await mkdir(join(root, '.jj'));
++  await mkdir(nested);
++
++  const [sessionStart] = handlers.get('session_start');
++  const [sessionSwitch] = handlers.get('session_switch');
++  const [beforeAgentStart] = handlers.get('before_agent_start');
++  await sessionStart({ type: 'session_start' }, { cwd: nested, hasUI: true });
++  const notice = await beforeAgentStart({ type: 'before_agent_start' }, { cwd: nested, hasUI: true });
++  assert.match(notice.message.content, /skill:\/\/setting-up-tracking-providers/);
++  assert.equal(await beforeAgentStart({ type: 'before_agent_start' }, { cwd: nested, hasUI: true }), undefined);
++
++  await mkdir(join(root, '.sjujperpowers'));
++  await writeFile(join(root, '.sjujperpowers/config.json'), '{}');
++  await sessionSwitch({ type: 'session_switch' }, { cwd: nested, hasUI: true });
++  assert.equal(await beforeAgentStart({ type: 'before_agent_start' }, { cwd: nested, hasUI: true }), undefined);
++
++  await rm(join(root, '.sjujperpowers'), { recursive: true });
++  await sessionSwitch({ type: 'session_switch' }, { cwd: nested, hasUI: false });
++  assert.equal(await beforeAgentStart({ type: 'before_agent_start' }, { cwd: nested, hasUI: false }), undefined);
++
++  await rm(join(root, '.jj'), { recursive: true });
++  await mkdir(join(root, '.git'));
++  await sessionSwitch({ type: 'session_switch' }, { cwd: nested, hasUI: true });
++  const gitOnlyNotice = await beforeAgentStart(
++    { type: 'before_agent_start' },
++    { cwd: nested, hasUI: true },
++  );
++  assert.match(gitOnlyNotice.message.content, /This isn't a jj repo\./);
++  assert.match(gitOnlyNotice.message.content, /jj git init --colocate/);
++  assert.match(gitOnlyNotice.message.content, /skill:\/\/setting-up-tracking-providers/);
+ });
+ 
+ test('OMP guidance translates namespaced skill identifiers to bare URIs', async () => {
+diff --git a/tests/tracking-providers/test-configure-providers.mjs b/tests/tracking-providers/test-configure-providers.mjs
+new file mode 100644
+index 0000000..b7bfef1
+--- /dev/null
++++ b/tests/tracking-providers/test-configure-providers.mjs
+@@ -0,0 +1,108 @@
++import assert from 'node:assert/strict';
++import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import test from 'node:test';
++import { configureProviders } from '../../skills/setting-up-tracking-providers/scripts/configure-providers.mjs';
++
++async function temporaryRoot(t) {
++  const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-configure-'));
++  t.after(() => rm(root, { recursive: true, force: true }));
++  return root;
++}
++
++function fileSessionConfig() {
++  return {
++    version: 1,
++    docsRoot: 'docs/project/',
++    roadmap: { provider: 'file' },
++    execution: { provider: 'session', completion: 'landed' },
++  };
++}
++
++test('writes one normalized provider configuration atomically', async t => {
++  const root = await temporaryRoot(t);
++
++  const config = await configureProviders(root, fileSessionConfig(), {
++    preflightKataFn: async () => assert.fail('session execution must not preflight Kata'),
++  });
++
++  assert.equal(config.docsRoot, 'docs/project');
++  assert.deepEqual(JSON.parse(await readFile(join(root, '.sjujperpowers/config.json'), 'utf8')), {
++    version: 1,
++    docsRoot: 'docs/project',
++    roadmap: { provider: 'file' },
++    execution: { provider: 'session', completion: 'landed' },
++  });
++});
++
++test('preflights the selected Kata project before writing', async t => {
++  const root = await temporaryRoot(t);
++  const projects = [];
++
++  await configureProviders(
++    root,
++    {
++      version: 1,
++      roadmap: { provider: 'plane', project: 'Homelab' },
++      execution: { provider: 'kata', project: 'homelab', completion: 'pull_request' },
++    },
++    {
++      preflightKataFn: async project => projects.push(project),
++    },
++  );
++
++  assert.deepEqual(projects, ['homelab']);
++  const persisted = JSON.parse(await readFile(join(root, '.sjujperpowers/config.json'), 'utf8'));
++  assert.equal(persisted.roadmap.project, 'Homelab');
++  assert.equal(persisted.execution.project, 'homelab');
++  assert.equal(persisted.execution.completion, 'pull_request');
++});
++
++test('leaves no configuration when Kata preflight fails', async t => {
++  const root = await temporaryRoot(t);
++  const failure = new Error('kata project unavailable');
++
++  await assert.rejects(
++    configureProviders(
++      root,
++      {
++        version: 1,
++        roadmap: { provider: 'file' },
++        execution: { provider: 'kata', project: 'missing', completion: 'landed' },
++      },
++      { preflightKataFn: async () => { throw failure; } },
++    ),
++    failure,
++  );
++  await assert.rejects(readFile(join(root, '.sjujperpowers/config.json')), { code: 'ENOENT' });
++});
++
++test('refuses to replace existing project policy without overwrite', async t => {
++  const root = await temporaryRoot(t);
++  await configureProviders(root, fileSessionConfig());
++
++  await assert.rejects(
++    configureProviders(root, fileSessionConfig()),
++    /already exists; pass --overwrite to replace it/,
++  );
++});
++
++test('requires active Plane guidance across shipped lifecycle skills', async () => {
++  const skillsRoot = new URL('../../skills/', import.meta.url);
++  const entries = await readdir(skillsRoot, { recursive: true });
++  const skillFiles = entries.filter(path => path.endsWith('SKILL.md'));
++  const corpus = (await Promise.all(skillFiles.map(path => readFile(new URL(path, skillsRoot), 'utf8')))).join('\n');
++
++  const tracking = await readFile(new URL('tracking-providers/SKILL.md', skillsRoot), 'utf8');
++  const brainstorming = await readFile(new URL('brainstorming/SKILL.md', skillsRoot), 'utf8');
++  const roadmapping = await readFile(new URL('roadmapping/SKILL.md', skillsRoot), 'utf8');
++  const finishing = await readFile(new URL('finishing-a-change-stack/SKILL.md', skillsRoot), 'utf8');
++
++  assert.match(tracking, /Plane is an active shared backlog/);
++  assert.match(brainstorming, /do not create it during context exploration/);
++  assert.match(brainstorming, /after design approval.*create or reuse the outcome.*then save/i);
++  assert.match(roadmapping, /Routine outcome creation and maintenance/);
++  assert.match(finishing, /post the roll-up as a Plane\s+comment/);
++  assert.doesNotMatch(corpus, /Plane support is reference-based|integration is reference-only|do not .*mutate Plane|Do not apply it|carries an existing external outcome reference|require.*existing.*plane/i);
++});
+diff --git a/tests/tracking-providers/test-symlinked-cli.mjs b/tests/tracking-providers/test-symlinked-cli.mjs
+index fef7c55..ac1638a 100644
+--- a/tests/tracking-providers/test-symlinked-cli.mjs
++++ b/tests/tracking-providers/test-symlinked-cli.mjs
+@@ -8,18 +8,18 @@ import { promisify } from 'node:util';
+ import test from 'node:test';
+ 
+ const execFile = promisify(execFileCallback);
+-const skillDir = dirname(fileURLToPath(new URL('../../skills/tracking-providers/SKILL.md', import.meta.url)));
++const repoRoot = dirname(fileURLToPath(new URL('../../package.json', import.meta.url)));
+ 
+-async function symlinkedScript(name) {
++async function symlinkedScript(skillName, name) {
+   const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-symlinked-cli-'));
+   const skillsDir = join(root, 'skills');
+   await mkdir(skillsDir);
+-  await symlink(skillDir, join(skillsDir, 'tracking-providers'), 'dir');
+-  return join(skillsDir, 'tracking-providers', 'scripts', name);
++  await symlink(join(repoRoot, 'skills', skillName), join(skillsDir, skillName), 'dir');
++  return join(skillsDir, skillName, 'scripts', name);
+ }
+ 
+ test('resolve-config CLI runs through a symlinked skill directory', async () => {
+-  const script = await symlinkedScript('resolve-config.mjs');
++  const script = await symlinkedScript('tracking-providers', 'resolve-config.mjs');
+   const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-default-config-'));
+   const { stdout } = await execFile(process.execPath, [script, '--root', root]);
+ 
+@@ -33,10 +33,29 @@ test('resolve-config CLI runs through a symlinked skill directory', async () =>
+ });
+ 
+ test('materialize-plan CLI validates arguments through a symlinked skill directory', async () => {
+-  const script = await symlinkedScript('materialize-plan.mjs');
++  const script = await symlinkedScript('tracking-providers', 'materialize-plan.mjs');
+ 
+   await assert.rejects(
+     execFile(process.execPath, [script, '--unknown']),
+     (error) => error.code === 2 && /unknown argument: --unknown/.test(error.stderr),
+   );
+ });
++
++test('configure-providers CLI runs through a symlinked skill directory', async () => {
++  const script = await symlinkedScript('setting-up-tracking-providers', 'configure-providers.mjs');
++  const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-configured-providers-'));
++  const { stdout } = await execFile(process.execPath, [
++    script,
++    '--root',
++    root,
++    '--roadmap',
++    'file',
++    '--execution',
++    'session',
++  ]);
++
++  const config = JSON.parse(stdout);
++  assert.equal(config.configPath, join(root, '.sjujperpowers/config.json'));
++  assert.equal(config.roadmap.provider, 'file');
++  assert.equal(config.execution.provider, 'session');
++});
