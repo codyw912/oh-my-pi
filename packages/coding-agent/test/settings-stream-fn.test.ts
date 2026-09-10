@@ -27,6 +27,12 @@ const stubModel = {} as unknown as Model;
 const stubCodexModel = { api: "openai-codex-responses" } as unknown as Model;
 const stubResponsesModel = { api: "openai-responses" } as unknown as Model;
 const stubContext = { messages: [], tools: [], systemPrompt: [] } as unknown as Context;
+const bifrostOpenCodeModel = {
+	api: "openai-completions",
+	provider: "bifrost-chat",
+	id: "opencode-go/glm-5.3",
+	baseUrl: "http://bifrost.home.lan:4200/v1",
+} as unknown as Model;
 
 describe("createSettingsAwareStreamFn", () => {
 	it("applies provider settings to the forwarded options when caller omits them", () => {
@@ -49,6 +55,90 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(options?.loopGuard).toEqual({ enabled: true, checkAssistantContent: true });
 		// caller's own option is preserved
 		expect(options?.apiKey).toBe("k");
+	});
+
+	describe("OpenCode session routing", () => {
+		it("forwards one stable session through Bifrost", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+			wrapped(bifrostOpenCodeModel, stubContext, { sessionId: "session-123" });
+
+			expect(calls[0]?.options?.headers).toEqual({
+				"x-bf-eh-x-opencode-session": "session-123",
+				"x-bf-eh-x-opencode-client": "omp",
+				"x-bf-session-id": "session-123",
+			});
+		});
+
+		it("recognizes every Bifrost OpenCode protocol adapter", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+			for (const id of [
+				"opencode-go/glm-5.3",
+				"opencode-go-responses/gpt-5.6-luna",
+				"opencode-go-messages/qwen3.7-plus",
+			]) {
+				wrapped({ ...bifrostOpenCodeModel, id } as Model, stubContext, { sessionId: "session-123" });
+			}
+
+			expect(calls).toHaveLength(3);
+			for (const call of calls) {
+				expect(call.options?.headers?.["x-bf-eh-x-opencode-session"]).toBe("session-123");
+			}
+		});
+
+		it("does not add routing headers to unrelated models", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+			wrapped(stubCodexModel, stubContext, { sessionId: "session-123" });
+
+			expect(calls[0]?.options?.headers).toBeUndefined();
+		});
+
+		it("maps a standard per-request session override onto Bifrost forwarding", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+			wrapped(bifrostOpenCodeModel, stubContext, {
+				sessionId: "session-123",
+				headers: { "X-OpenCode-Session": "caller-session" },
+			});
+
+			expect(calls[0]?.options?.headers?.["x-bf-eh-x-opencode-session"]).toBe("caller-session");
+			expect(calls[0]?.options?.headers?.["x-bf-session-id"]).toBe("caller-session");
+		});
+
+		it("maps a standard model session override onto Bifrost forwarding", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+			const model = {
+				...bifrostOpenCodeModel,
+				headers: { "x-opencode-session": "model-session" },
+			} as Model;
+
+			wrapped(model, stubContext, { sessionId: "session-123" });
+
+			expect(calls[0]?.options?.headers?.["x-bf-eh-x-opencode-session"]).toBe("model-session");
+			expect(calls[0]?.options?.headers?.["x-bf-session-id"]).toBe("model-session");
+		});
+
+		it("merges a mixed-case Bifrost session override without duplicate wire headers", () => {
+			const { fn: base, calls } = captureBase();
+			const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+			wrapped(bifrostOpenCodeModel, stubContext, {
+				sessionId: "session-123",
+				headers: { "X-BF-EH-X-OpenCode-Session": "caller-session" },
+			});
+
+			const sessionHeaders = Object.entries(calls[0]?.options?.headers ?? {}).filter(
+				([name]) => name.toLowerCase() === "x-bf-eh-x-opencode-session",
+			);
+			expect(sessionHeaders).toEqual([["X-BF-EH-X-OpenCode-Session", "caller-session"]]);
+			expect(calls[0]?.options?.headers?.["x-bf-session-id"]).toBe("caller-session");
+		});
 	});
 
 	it("keeps assistant prose loop scanning at its configured default", () => {

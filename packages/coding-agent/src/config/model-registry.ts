@@ -865,7 +865,8 @@ export class ModelRegistry {
 		resolvedDefaults = this.#mergeResolvedModels(resolvedDefaults, select(this.#runtimeDiscoveredModels));
 		const withConfigModels = this.#mergeCustomModels(resolvedDefaults, select(this.#customModelOverlays));
 		const combined = this.#mergeCustomModels(withConfigModels, select(this.#runtimeModelOverlays));
-		const withModelOverrides = this.#applyModelOverrides(collapseBuiltVariants(combined), this.#modelOverrides);
+		const withPolicies = this.#applyHardcodedModelPolicies(collapseBuiltVariants(combined));
+		const withModelOverrides = this.#applyModelOverrides(withPolicies, this.#modelOverrides);
 		const withProviderBedrock = this.#applyProviderBedrockOverrides(withModelOverrides);
 		return this.#applyLlamaCppModelFixups(this.#applyRuntimeProviderOverrides(withProviderBedrock));
 	}
@@ -1507,7 +1508,8 @@ export class ModelRegistry {
 		const resolved = this.#mergeResolvedModels(baseModels, discoveredModels);
 		const withConfigModels = this.#mergeCustomModels(resolved, this.#customModelOverlays);
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
-		const withModelOverrides = this.#applyModelOverrides(collapseBuiltVariants(combined), this.#modelOverrides);
+		const withPolicies = this.#applyHardcodedModelPolicies(collapseBuiltVariants(combined));
+		const withModelOverrides = this.#applyModelOverrides(withPolicies, this.#modelOverrides);
 		const withProviderBedrock = this.#applyProviderBedrockOverrides(withModelOverrides);
 		this.#unprojectedModels = this.#applyLlamaCppModelFixups(
 			this.#applyRuntimeProviderOverrides(withProviderBedrock),
@@ -2155,6 +2157,8 @@ export class ModelRegistry {
 			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
 				return model;
 			}
+			const customModel = this.#resolveLiveCustomModelOverlay(model);
+			if (customModel?.contextWindow !== undefined) return model;
 			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
 			if (!overrides) {
 				return applyModelOverride(model, { contextWindow: 1_000_000 });

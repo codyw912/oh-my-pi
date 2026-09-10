@@ -15,10 +15,85 @@ import { type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { type Settings, validateProviderMaxInFlightRequests } from "../config/settings";
 
+const OPENCODE_HOST = "opencode.ai";
+const OPENCODE_SESSION_HEADER = "x-opencode-session";
+const OPENCODE_CLIENT_HEADER = "x-opencode-client";
+const BIFROST_FORWARDED_SESSION_HEADER = `x-bf-eh-${OPENCODE_SESSION_HEADER}`;
+const BIFROST_FORWARDED_CLIENT_HEADER = `x-bf-eh-${OPENCODE_CLIENT_HEADER}`;
+const BIFROST_SESSION_HEADER = "x-bf-session-id";
+const BIFROST_OPENCODE_MODEL_PREFIXES = ["opencode-go/", "opencode-go-responses/", "opencode-go-messages/"];
+
 function timeoutSecondsToMs(value: number): number | undefined {
 	if (!Number.isFinite(value) || value < 0) return undefined;
 	if (value === 0) return 0;
 	return Math.max(1, Math.trunc(value * 1000));
+}
+
+function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
+	const merged: Record<string, string> = {};
+	const keyByLower = new Map<string, string>();
+	for (const headers of headerSources) {
+		if (!headers) continue;
+		for (const [key, value] of Object.entries(headers)) {
+			const lower = key.toLowerCase();
+			const existing = keyByLower.get(lower);
+			if (existing !== undefined && existing !== key) delete merged[existing];
+			keyByLower.set(lower, key);
+			merged[key] = value;
+		}
+	}
+	return merged;
+}
+
+function getHeader(headers: Record<string, string>, name: string): string | undefined {
+	const lowerName = name.toLowerCase();
+	for (const key in headers) {
+		if (key.toLowerCase() === lowerName) return headers[key];
+	}
+	return undefined;
+}
+
+function matchesHost(baseUrl: string | undefined, expectedHost: string): boolean {
+	try {
+		return baseUrl ? new URL(baseUrl).hostname === expectedHost : false;
+	} catch {
+		return false;
+	}
+}
+
+function openCodeRoutingHeaders(
+	model: Parameters<StreamFn>[0],
+	streamOptions: SimpleStreamOptions | undefined,
+): Record<string, string> | undefined {
+	const routesThroughBifrost = BIFROST_OPENCODE_MODEL_PREFIXES.some(prefix => model.id?.startsWith(prefix));
+	const targetsOpenCode =
+		routesThroughBifrost ||
+		model.provider === "opencode" ||
+		model.provider === "opencode-go" ||
+		matchesHost(model.baseUrl, OPENCODE_HOST);
+	if (!targetsOpenCode) return undefined;
+
+	const callerHeaders = mergeHeaders(model.headers, streamOptions?.headers);
+	const sessionId =
+		(routesThroughBifrost ? getHeader(callerHeaders, BIFROST_FORWARDED_SESSION_HEADER) : undefined) ??
+		getHeader(callerHeaders, OPENCODE_SESSION_HEADER) ??
+		streamOptions?.sessionId;
+	if (!sessionId) return undefined;
+	const client =
+		(routesThroughBifrost ? getHeader(callerHeaders, BIFROST_FORWARDED_CLIENT_HEADER) : undefined) ??
+		getHeader(callerHeaders, OPENCODE_CLIENT_HEADER) ??
+		"omp";
+
+	return routesThroughBifrost
+		? {
+				[BIFROST_FORWARDED_SESSION_HEADER]: sessionId,
+				[BIFROST_FORWARDED_CLIENT_HEADER]: client,
+				[BIFROST_SESSION_HEADER]: sessionId,
+			}
+		: {
+				[OPENCODE_SESSION_HEADER]: sessionId,
+				[OPENCODE_CLIENT_HEADER]: client,
+			};
 }
 
 /**
@@ -64,6 +139,9 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 		const serverSideFallbackEnabled =
 			serverSideFallbackIdentity?.class === "anthropic" &&
 			(serverSideFallbackIdentity.family === "fable" || serverSideFallbackIdentity.family === "mythos");
+		const routingHeaders = openCodeRoutingHeaders(model, streamOptions);
+		const headers =
+			routingHeaders || streamOptions?.headers ? mergeHeaders(routingHeaders, streamOptions?.headers) : undefined;
 		const fallbacks =
 			streamOptions?.fallbacks ?? (serverSideFallbackEnabled ? [{ model: "claude-opus-4-8" }] : undefined);
 		const merged: SimpleStreamOptions = {
@@ -84,6 +162,7 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 				...streamOptions?.loopGuard,
 			},
 			hideThinkingSummary: streamOptions?.hideThinkingSummary ?? settings.get("omitThinking"),
+			...(headers !== undefined ? { headers } : {}),
 			...(fallbacks !== undefined ? { fallbacks } : {}),
 		};
 		return base(model, context, merged);

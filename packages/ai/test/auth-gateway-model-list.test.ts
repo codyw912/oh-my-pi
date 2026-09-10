@@ -10,7 +10,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 test("model listing exposes one provider-qualified route per upstream model", async () => {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-model-list-"));
 	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-	const anthropic = createMockModel({ provider: "anthropic", id: "shared-model" });
+	const anthropic = createMockModel({ provider: "anthropic", id: "shared-model", reasoning: true });
 	const devin = createMockModel({ provider: "devin", id: "shared-model" });
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
@@ -35,6 +35,7 @@ test("model listing exposes one provider-qualified route per upstream model", as
 					display_name: "shared-model",
 					context_length: 200_000,
 					max_output_tokens: 32_768,
+					reasoning: true,
 					input_modalities: ["text"],
 				},
 				{
@@ -45,6 +46,7 @@ test("model listing exposes one provider-qualified route per upstream model", as
 					display_name: "shared-model",
 					context_length: 200_000,
 					max_output_tokens: 32_768,
+					reasoning: false,
 					input_modalities: ["text"],
 				},
 			],

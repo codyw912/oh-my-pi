@@ -15,6 +15,7 @@ import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text"
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
+import { traceSkillLoad } from "../skill-telemetry";
 export interface Skill {
 	name: string;
 	description: string;
@@ -160,6 +161,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// — third-party CLI toggles must never silently hide them (cf. #2401). The
 		// master `enabled` flag above still gates them.
 		if (provider === MANAGED_SKILLS_PROVIDER_ID) return true;
+		// OMP-linked packages are native to this harness, not third-party CLI sources.
+		if (provider === "omp-plugins") return true;
 		if (provider === "codex" && level === "user") return enableCodexUser || isUserSourceEnabled("codex");
 		if (provider === "claude" && level === "user") return enableClaudeUser || isUserSourceEnabled("claude");
 		if (provider === "claude" && level === "project") return enableClaudeProject;
@@ -497,43 +500,45 @@ function startsWithLocalExecutionPrefix(trimmedStart: string): boolean {
 export type SkillInvocationKind = "user" | "autoload";
 
 export async function buildSkillPromptMessage(
-	skill: Pick<Skill, "name" | "filePath" | "baseDir">,
+	skill: Pick<Skill, "name" | "filePath" | "baseDir"> & Partial<Pick<Skill, "source">>,
 	args: string,
 	invocation: SkillInvocationKind = "user",
 ): Promise<BuiltSkillPromptMessage> {
-	const content = await Bun.file(skill.filePath).text();
-	const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-	const trimmedArgs = args.trim();
-	let message: string;
-	if (invocation === "user") {
-		// User-invoked skills announce themselves and expose their skill directory
-		// so the model resolves the skill's own relative paths (scripts/, templates/).
-		message = prompt
-			.render(userInvocationTemplate, {
+	return traceSkillLoad(skill, invocation, async () => {
+		const content = await Bun.file(skill.filePath).text();
+		const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
+		const trimmedArgs = args.trim();
+		let message: string;
+		if (invocation === "user") {
+			// User-invoked skills announce themselves and expose their skill directory
+			// so the model resolves the skill's own relative paths (scripts/, templates/).
+			message = prompt
+				.render(userInvocationTemplate, {
+					name: skill.name,
+					body,
+					baseDir: skill.baseDir,
+					userArgs: trimmedArgs || undefined,
+				})
+				.trim();
+		} else {
+			// Autoload skills are hidden, non-user context — they MUST NOT claim the
+			// user invoked them; this keeps the minimal provenance-only format.
+			message = prompt
+				.render(autoloadTemplate, {
+					body,
+					filePath: skill.filePath,
+					userArgs: trimmedArgs || undefined,
+				})
+				.trim();
+		}
+		return {
+			message,
+			details: {
 				name: skill.name,
-				body,
-				baseDir: skill.baseDir,
-				userArgs: trimmedArgs || undefined,
-			})
-			.trim();
-	} else {
-		// Autoload skills are hidden, non-user context — they MUST NOT claim the
-		// user invoked them; this keeps the minimal provenance-only format.
-		message = prompt
-			.render(autoloadTemplate, {
-				body,
-				filePath: skill.filePath,
-				userArgs: trimmedArgs || undefined,
-			})
-			.trim();
-	}
-	return {
-		message,
-		details: {
-			name: skill.name,
-			path: skill.filePath,
-			args: trimmedArgs || undefined,
-			lineCount: body ? body.split("\n").length : 0,
-		},
-	};
+				path: skill.filePath,
+				args: trimmedArgs || undefined,
+				lineCount: body ? body.split("\n").length : 0,
+			},
+		};
+	});
 }

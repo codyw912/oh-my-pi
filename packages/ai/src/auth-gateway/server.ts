@@ -816,6 +816,7 @@ interface ModelListRow {
 	display_name: string;
 	context_length?: number;
 	max_output_tokens?: number;
+	reasoning: boolean;
 	input_modalities: ("text" | "image")[];
 	supports_tools?: boolean;
 }
@@ -833,6 +834,7 @@ function handleModelsList(opts: AuthGatewayBootOptions): Response {
 			owned_by: model.provider,
 			api: model.api,
 			display_name: model.name,
+			reasoning: model.reasoning,
 			input_modalities: model.input,
 		};
 		if (model.contextWindow != null) row.context_length = model.contextWindow;

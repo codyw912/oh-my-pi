@@ -1,6 +1,7 @@
 import type { Api, Model, ModelSpec, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getVariantAliasSources, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
+import { resolveMaxContextWindow } from "@oh-my-pi/pi-catalog/compat/context-window";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
@@ -134,6 +135,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		...(supportsTools !== undefined ? { supportsTools } : {}),
 		cost,
 		contextWindow: resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : null),
+		maxContextWindow: reference ? resolveMaxContextWindow(reference) : undefined,
 		maxTokens: resolvedModel.maxTokens ?? reference?.maxTokens ?? (options.useDefaults ? 16384 : null),
 		headers: resolvedModel.headers,
 		omitMaxOutputTokens: resolvedModel.omitMaxOutputTokens ?? reference?.omitMaxOutputTokens,

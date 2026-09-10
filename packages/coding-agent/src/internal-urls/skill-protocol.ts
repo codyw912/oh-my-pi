@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { resolveContainedPath } from "../discovery/contained-path";
 import { getActiveSkills } from "../extensibility/skills";
+import { traceSkillLoad } from "../skill-telemetry";
 import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
@@ -94,32 +95,35 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			targetPath = context?.pathOnly === true ? skill.baseDir : skill.filePath;
 		}
 
-		let stats: fsTypes.Stats;
-		try {
-			stats = await fs.stat(targetPath);
-		} catch (error) {
-			if (isEnoent(error)) {
-				throw new Error(`File not found: ${targetPath}`);
+		const loadKind = context?.pathOnly === true || hasRelativePath ? "resource" : "agent";
+		return traceSkillLoad(skill, loadKind, async () => {
+			let stats: fsTypes.Stats;
+			try {
+				stats = await fs.stat(targetPath);
+			} catch (error) {
+				if (isEnoent(error)) {
+					throw new Error(`File not found: ${targetPath}`);
+				}
+				throw error;
 			}
-			throw error;
-		}
 
-		if (stats.isDirectory()) {
-			return buildDirectoryResource(url.href, targetPath);
-		}
-		if (!stats.isFile()) {
-			throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
-		}
+			if (stats.isDirectory()) {
+				return buildDirectoryResource(url.href, targetPath);
+			}
+			if (!stats.isFile()) {
+				throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
+			}
 
-		const content = await Bun.file(targetPath).text();
-		return {
-			url: url.href,
-			content,
-			contentType: getContentType(targetPath),
-			size: Buffer.byteLength(content, "utf-8"),
-			sourcePath: targetPath,
-			notes: [],
-		};
+			const content = await Bun.file(targetPath).text();
+			return {
+				url: url.href,
+				content,
+				contentType: getContentType(targetPath),
+				size: Buffer.byteLength(content, "utf-8"),
+				sourcePath: targetPath,
+				notes: [],
+			};
+		});
 	}
 
 	async complete(): Promise<UrlCompletion[]> {

@@ -179,6 +179,16 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 		expect(parsed.stream).toBe(false);
 	});
 
+	it("maps reasoning_effort none to disabled reasoning", () => {
+		const parsed = parseRequest({
+			model: "m",
+			messages: [{ role: "user", content: "hi" }],
+			reasoning_effort: "none",
+		});
+		expect(parsed.options.disableReasoning).toBe(true);
+		expect(parsed.options.reasoning).toBeUndefined();
+	});
+
 	it("accepts assistant null content when replaying tool calls", () => {
 		const parsed = parseRequest({
 			model: "m",

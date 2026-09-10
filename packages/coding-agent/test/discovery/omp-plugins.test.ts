@@ -12,7 +12,7 @@
  * `home` instead of `os.homedir()`. Module-level CLI injection state is
  * reset between cases so they cannot poison each other.
  */
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -36,6 +36,7 @@ import {
 	withOmpExtensionRootScope,
 } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
 import { discoverExtensionPaths } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { loadSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 const PROVIDER_ID = "omp-plugins";
@@ -105,6 +106,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	clearCache();
 	clearOmpExtensionCliRoots();
 	if (originalAgentDirEnv) {
@@ -700,4 +702,33 @@ test("linked plugins (only in lockfile, not in package.json#dependencies) are su
 	const tools = await loadFromPlugin<{ name: string; path: string }>(toolCapability.id, ctx());
 	expect(skills.find(s => s.name === "my-skill" && s.path.includes("my-linked-ext"))).toBeDefined();
 	expect(tools.find(t => t.name === "wcount" && t.path.includes("my-linked-ext"))).toBeDefined();
+});
+
+test("linked plugin skills stay enabled when named sources are disabled", async () => {
+	const pluginsDir = path.join(home, ".omp", "plugins");
+	const nodeModules = path.join(pluginsDir, "node_modules");
+	fs.mkdirSync(nodeModules, { recursive: true });
+	fs.symlinkSync(ext, path.join(nodeModules, "my-linked-ext"));
+	writeFile(
+		path.join(pluginsDir, "omp-plugins.lock.json"),
+		JSON.stringify({
+			plugins: { "my-linked-ext": { version: "1.0.0", enabled: true, enabledFeatures: null } },
+			settings: {},
+		}),
+	);
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+
+	const { skills } = await loadSkills({
+		cwd: project,
+		enableCodexUser: false,
+		enableClaudeUser: false,
+		enableClaudeProject: false,
+		enablePiUser: false,
+		enablePiProject: false,
+		enableAgentsUser: false,
+		enableAgentsProject: false,
+	});
+
+	const linkedSkill = skills.find(s => s.name === "my-skill" && s.source === "omp-plugins:user");
+	expect(linkedSkill?._source?.provider).toBe("omp-plugins");
 });
