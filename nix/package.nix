@@ -139,7 +139,7 @@ stdenv.mkDerivation {
     runHook preBuild
 
     echo "Building pi-natives"
-    cargo build --release -p pi-natives ${lib.optionalString withWaylandScreencast "--features wayland-pipewire"}
+    cargo build --release --jobs "$NIX_BUILD_CORES" -p pi-natives ${lib.optionalString withWaylandScreencast "--features wayland-pipewire"}
     install -Dm755 "target/release/${platform.nativeLibrary}" \
       "packages/natives/native/${platform.addon}"
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
