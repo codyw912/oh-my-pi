@@ -92,13 +92,21 @@ export type DaemonOperation =
 	| { op: "stop"; name: string; timeoutMs: number }
 	| { op: "restart"; name: string }
 	| { op: "describe"; name: string }
+	| {
+			op: "route-completion";
+			name: string;
+			id: string;
+			startedAt: number;
+			fromOwner: string;
+			toOwner: string;
+	  }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
-	| { op: "list"; daemons: DaemonSnapshot[] }
+	| { op: "list"; daemons: DaemonSnapshot[]; pendingCompletions?: DaemonCompletionNotification[] }
 	| {
 			op: "logs";
 			name: string;
@@ -116,6 +124,7 @@ export type DaemonRpcResult =
 	| { op: "stop"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
+	| { op: "route-completion"; daemon: DaemonSnapshot; routedOwner: string }
 	| { op: "shutdown" };
 
 /** Authenticated request envelope used by socket clients. */
@@ -338,6 +347,15 @@ export function parseDaemonWireMessage(value: unknown): DaemonWireMessage {
 	return parseDaemonWireResponse(value);
 }
 
+function parseDaemonCompletionNotifications(value: unknown): DaemonCompletionNotification[] {
+	if (!Array.isArray(value)) throw new Error("result.pendingCompletions must be an array");
+	return value.map(item => {
+		const message = parseDaemonWireMessage(item);
+		if (!("event" in message)) throw new Error("result.pendingCompletions must contain completion events");
+		return message;
+	});
+}
+
 function parseDaemonOperation(value: unknown): DaemonOperation {
 	const source = record(value, "daemon operation");
 	const op = stringValue(source.op, "operation.op");
@@ -394,6 +412,15 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 		case "restart":
 		case "describe":
 			return { op, name: stringValue(source.name, "operation.name") };
+		case "route-completion":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				id: stringValue(source.id, "operation.id"),
+				startedAt: numberValue(source.startedAt, "operation.startedAt"),
+				fromOwner: stringValue(source.fromOwner, "operation.fromOwner"),
+				toOwner: stringValue(source.toOwner, "operation.toOwner"),
+			};
 		default:
 			throw new Error(`Unknown daemon operation: ${op}`);
 	}
@@ -413,7 +440,14 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			};
 		case "list": {
 			if (!Array.isArray(source.daemons)) throw new Error("result.daemons must be an array");
-			return { op: "list", daemons: source.daemons.map(parseDaemonSnapshot) };
+			return {
+				op: "list",
+				daemons: source.daemons.map(parseDaemonSnapshot),
+				pendingCompletions:
+					source.pendingCompletions === undefined
+						? undefined
+						: parseDaemonCompletionNotifications(source.pendingCompletions),
+			};
 		}
 		case "logs":
 			return {
@@ -446,6 +480,12 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				op: "describe",
 				daemon: parseDaemonSnapshot(source.daemon),
 				spec: parseDaemonSpec(source.spec),
+			};
+		case "route-completion":
+			return {
+				op: "route-completion",
+				daemon: parseDaemonSnapshot(source.daemon),
+				routedOwner: stringValue(source.routedOwner, "result.routedOwner"),
 			};
 		case "shutdown":
 			return { op: "shutdown" };

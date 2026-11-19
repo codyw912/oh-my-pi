@@ -1184,7 +1184,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			// Suppress the completion delivery up front so a job finishing while we
 			// foreground-wait cannot also be injected by the delivery loop. Lifted
 			// via resumeDeliveries() if we end up backgrounding after all.
-			autoBgManager.acknowledgeDeliveries([job.jobId]);
+			autoBgManager.suppressDeliveries([job.jobId]);
 			const waitResult = await raceJobSettlement(
 				job.completion,
 				autoBackgroundWaitMs,

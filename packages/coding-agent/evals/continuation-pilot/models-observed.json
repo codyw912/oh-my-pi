@@ -1,0 +1,64 @@
+{
+  "source": "Governed subscription gateway GET /v1/models",
+  "inferenceRequests": 0,
+  "models": [
+    {
+      "id": "anthropic/claude-fable-5-1",
+      "object": "model",
+      "owned_by": "anthropic",
+      "api": "anthropic-messages",
+      "display_name": "Claude Fable 5.1",
+      "reasoning": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "context_length": 1000000,
+      "max_output_tokens": 128000
+    },
+    {
+      "id": "openai-codex/gpt-6-astra",
+      "object": "model",
+      "owned_by": "openai-codex",
+      "api": "openai-codex-responses",
+      "display_name": "GPT-6-Astra",
+      "reasoning": true,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "context_length": 1050000,
+      "max_output_tokens": 128000
+    }
+  ],
+  "availability": "advertised, not inference-tested",
+  "blockingIssue": "Subscription gateway is excluded because of hidden upstream retries; Bifrost is also excluded because its HTTP transport can replay POSTs. OpenCode Go is excluded because the operator reports its monthly allowance is exhausted.",
+  "directPilot": {
+    "route": "direct-fireworks",
+    "availability": "Both approved Fireworks routes completed the operator-run pilot: 85 new returned requests, two shared-primer calls and six continuations. All six submitted artifacts; four passed all automated checks. Human quality review is pending, with error-evidence and inherited-instruction limitations recorded in AGENT-13.",
+    "source": {
+      "id": "accounts/fireworks/models/minimax-m3",
+      "api": "anthropic-messages",
+      "displayedContext": "512k tokens",
+      "inputUsdPerMillion": 0.30,
+      "outputUsdPerMillion": 1.20,
+      "url": "https://app.fireworks.ai/models/fireworks/minimax-m3"
+    },
+    "destination": {
+      "id": "accounts/fireworks/models/deepseek-v4-flash-0731",
+      "api": "openai-responses",
+      "displayedContext": "1M tokens",
+      "inputUsdPerMillion": 0.22,
+      "outputUsdPerMillion": 0.66,
+      "url": "https://app.fireworks.ai/models/fireworks/deepseek-v4-flash-0731"
+    },
+    "servingTier": "Standard (omit service_tier)",
+    "reserveInputTokensPerRequest": { "source": 524288, "destination": 1048576 },
+    "accounting": "Keep one cumulative $5 cap with no total or per-stage request-count limits. Reserve the model's entire context ceiling plus 16384 output tokens before every dispatch; reconcile complete validated usage including cached input at uncached rates. Retain failed or ambiguous reservations and stop. Preserve prior ledger bytes and charges when carrying usage forward. Stop before dispatch if the next reserve exceeds remaining spending headroom. Request bodies may use up to 524288 bytes.",
+    "pricingSource": "https://docs.fireworks.ai/serverless/pricing.md",
+    "messagesSource": "https://docs.fireworks.ai/tools-sdks/anthropic-compatibility.md",
+    "responsesSource": "https://docs.fireworks.ai/guides/response-api.md",
+    "credentialReference": "op://Agents/Fireworks API/credential",
+    "credentialHandling": "Operator-only one-command runner: 1Password CLI pipes the approved field directly to relay stdin. The script runs the sandboxed pilot and stops the relay automatically. No key in shell variables, environment exports, source, logs, argv, files, chat, or the OMP sandbox. Prior usage is retained; no extra chat approval is required."
+  }
+}

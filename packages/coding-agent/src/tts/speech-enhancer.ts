@@ -15,12 +15,14 @@
  *   mechanical {@link SpeakableStream} cleanup — speech never blocks on the
  *   model.
  */
-import { type AssistantMessage, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
+import { type AssistantMessage, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import speechRewritePrompt from "../prompts/system/speech-rewrite.md" with { type: "text" };
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 
 const SYSTEM_PROMPT = prompt.render(speechRewritePrompt);
 // Rewrite budget: a paragraph in, a spoken paragraph (usually shorter) out.
@@ -38,8 +40,10 @@ const MAX_BLOCK_CHARS = 4000;
 export interface SpeechEnhancerDeps {
 	settings: Settings;
 	registry: ModelRegistry;
-	sessionId: string;
+	sessionId: string | (() => string);
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	inferenceStreamFn?: StreamFn;
+	continuationEnrolled?: boolean;
 }
 
 function extractText(content: AssistantMessage["content"]): string {
@@ -69,7 +73,8 @@ export class SpeechEnhancer {
 	 */
 	async rewrite(block: string, signal?: AbortSignal): Promise<string | null> {
 		try {
-			const { settings, registry, sessionId } = this.#deps;
+			const { settings, registry } = this.#deps;
+			const sessionId = typeof this.#deps.sessionId === "function" ? this.#deps.sessionId() : this.#deps.sessionId;
 			// `@tiny` expands a configured `modelRoles.tiny` and otherwise falls
 			// through tiny's alias to the smol priority chain — unlike bare role
 			// lookup, this resolves even with no roles configured.
@@ -85,7 +90,10 @@ export class SpeechEnhancer {
 			const response = await retryTransientCompletion(
 				() => {
 					const timeout = AbortSignal.timeout(REWRITE_TIMEOUT_MS);
-					return completeSimple(
+					return completeImplFromEnrollment(
+						this.#deps.inferenceStreamFn,
+						this.#deps.continuationEnrolled ?? false,
+					)(
 						model,
 						{
 							systemPrompt: [SYSTEM_PROMPT],

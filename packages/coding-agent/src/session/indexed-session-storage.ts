@@ -1,9 +1,11 @@
 import { toError } from "@oh-my-pi/pi-utils";
-import type {
-	SessionStorage,
-	SessionStorageStat,
-	SessionStorageWriter,
-	WriteTextAtomicOptions,
+import {
+	UNSUPPORTED_INDEXED_CONTINUATION_DURABILITY,
+	type SessionStorage,
+	type SessionStorageContinuationDurability,
+	type SessionStorageStat,
+	type SessionStorageWriter,
+	type WriteTextAtomicOptions,
 } from "./session-storage";
 import {
 	overlayTitleSlotContent,
@@ -100,6 +102,10 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	constructor(backend: SessionStorageBackend) {
 		this.#backend = backend;
+	}
+
+	continuationDurability(): SessionStorageContinuationDurability {
+		return UNSUPPORTED_INDEXED_CONTINUATION_DURABILITY;
 	}
 
 	async initialize(): Promise<void> {

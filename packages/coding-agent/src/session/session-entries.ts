@@ -32,6 +32,9 @@ export interface SessionTitleSlotEntry {
 
 export const EPHEMERAL_MODEL_CHANGE_ROLE = "fallback";
 
+export const CONTINUATION_BRIEFING_CUSTOM_TYPE = "omp-continuation-briefing";
+export const CONTINUATION_PROTECTED_CONTEXT_TYPE = "omp-continuation-protected-context";
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this

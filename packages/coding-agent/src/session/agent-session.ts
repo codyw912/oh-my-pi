@@ -252,6 +252,24 @@ import type {
 	SessionStats,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import type { ContinuationBindingFactory, ContinuationSessionBinding } from "./continuation-binding";
+import {
+	bindContinuationStream,
+	ContinuationAdmissionError,
+	ContinuationDestinationRejection,
+} from "./continuation-request";
+import {
+	bindContinuationCompletionOwners,
+	buildContinuationCompletionRouting,
+	captureContinuationServices,
+	routeContinuationCompletions,
+	stabilizeContinuationServices,
+	verifyContinuationServices,
+	type ContinuationActivatedHandoff,
+	type ContinuationHandoffInputs,
+	type ContinuationPreparationOptions,
+	type ContinuationPreparedHandoff,
+} from "./continuation-handoff";
 import { writeArtifact } from "./artifacts";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
@@ -298,6 +316,9 @@ import {
 	buildLaunchCompletionBatchMessage,
 	isLaunchCompletionOwner,
 	LAUNCH_COMPLETION_MESSAGE_TYPE,
+	launchCompletionDetailsContainDaemon,
+	launchCompletionGenerationKey,
+	rebindLaunchCompletionOwner,
 	type LaunchCompletionEntry,
 } from "./launch-completion";
 import {
@@ -516,6 +537,15 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 	};
 }
 
+interface ContinuationInputSnapshot {
+	version: 1;
+	sessionId: string;
+	steering: AgentMessage[];
+	followUp: AgentMessage[];
+	nextTurn: CustomMessage[];
+	irc: { interrupts: AgentMessage[]; asides: AgentMessage[] };
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -654,6 +684,30 @@ export class AgentSession {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	#continuationBinding: ContinuationSessionBinding | undefined;
+	#continuationBaseStream: StreamFn | undefined;
+	#continuationBaseSideStream: StreamFn | undefined;
+	#continuationStream: StreamFn | undefined;
+	#continuationSideStream: StreamFn | undefined;
+	#continuationCommitGate: Promise<void> | undefined;
+	#continuationCommitSourceSessionId: string | undefined;
+	#parkedLaunchCompletions: Array<{
+		notification: DaemonCompletionNotification;
+		resolve: () => void;
+		reject: (error: Error) => void;
+	}> = [];
+	#unregisterContinuationCompletions: ((preservePending?: boolean) => void) | undefined;
+	#continuationCompletionReady: Promise<void> = Promise.resolve();
+	#inFlightLaunchCompletions = new Map<string, Promise<void>>();
+	readonly #continuationInputs = new Set<Promise<void>>();
+	readonly #continuationPreparations = new Map<string, ContinuationPreparationOptions>();
+	readonly #continuationPreparation?: Omit<ContinuationPreparationOptions, "destination">;
+	#automaticContinuation: Promise<void> | undefined;
+	#adoptingContinuation = false;
+	#continuationInputWrites: Promise<void> = Promise.resolve();
+	#continuationInputSnapshot: string | undefined;
+	#unregisterJobAdmission: (() => void) | undefined;
+	#unregisterDeliveryAcceptance: (() => void) | undefined;
 	/**
 	 * Async-delivery generation, bumped on every session transition that evicts
 	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
@@ -1148,6 +1202,21 @@ export class AgentSession {
 	#codeModeState: { namespacesInfo?: unknown };
 
 	constructor(config: AgentSessionConfig) {
+		if (
+			config.continuationFactory &&
+			(config.asyncJobManager || config.ownedAsyncJobManager) &&
+			!config.agentId?.trim()
+		) {
+			throw new Error("Continuation with async jobs requires an explicit agentId");
+		}
+		if (
+			!config.continuationFactory &&
+			config.sessionManager
+				.getBranch()
+				.some(entry => entry.type === "custom" && entry.customType === "omp-continuation")
+		) {
+			throw new Error("An enrolled continuation session requires its explicit committed run controller");
+		}
 		this.agent = config.agent;
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
@@ -1198,6 +1267,7 @@ export class AgentSession {
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
+			withInput: work => this.#withContinuationInput(work),
 		};
 		this.#irc = new IrcBridge(ircHost);
 		const prewalkHost: PrewalkCoordinatorHost = {
@@ -1263,6 +1333,7 @@ export class AgentSession {
 			emit: event => this.#emit(event),
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
+			inferenceStreamFn: () => (this.#continuationBinding ? this.#sideStreamFn : undefined),
 		};
 		this.#models = new ModelControls(modelControlsHost, {
 			scopedModels: config.scopedModels,
@@ -1309,9 +1380,16 @@ export class AgentSession {
 			runAutoCompaction: (reason, willRetry, deferred, allowDefer, options) =>
 				this.#maintenance.runAutoCompaction(reason, willRetry, deferred, allowDefer, options),
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
+			beforeRecovery: error =>
+				this.#continuationBinding?.beforeRecovery(error) ?? Promise.resolve({ kind: "allow" as const }),
+			inferenceStreamFn: () => (this.#continuationBinding ? this.#sideStreamFn : undefined),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (this.#continuationBinding) {
+				const outcome = await this.#continuationBinding.beforeRecovery();
+				if (outcome.kind !== "allow") throw new ContinuationAdmissionError(outcome);
+			}
 			if (
 				!this.settings.get("retry.usageAwareFallback") ||
 				(this.#usagePreflightReadyForNextModelCall && this.#usagePreflightReadyModel === this.model)
@@ -1459,7 +1537,9 @@ export class AgentSession {
 		});
 		this.yieldQueue.register<LaunchCompletionEntry>(LAUNCH_COMPLETION_MESSAGE_TYPE, {
 			isStale: entry =>
-				this.#isDisposed || !isLaunchCompletionOwner(entry.owner, this.sessionManager.getSessionId()),
+				this.#isDisposed ||
+				!this.#isDeliverableLaunchCompletion(entry) ||
+				this.sessionManager.hasLaunchCompletionReceipt(entry.daemon),
 			build: buildLaunchCompletionBatchMessage,
 		});
 		// Background-job completions / late diagnostics are pulled into the run at
@@ -1551,6 +1631,8 @@ export class AgentSession {
 			onResponse: this.#onResponse,
 			onSseEvent: this.#onSseEvent,
 			obfuscator: this.#obfuscator,
+			inferenceStreamFn: () => (this.#continuationBinding ? this.#sideStreamFn : undefined),
+			continuationFactory: () => this.#continuationBinding?.factory,
 		};
 		this.#providerBoundary = new SessionProviderBoundary(providerBoundaryHost);
 		const streamGuardsHost: StreamGuardsHost = {
@@ -1570,6 +1652,11 @@ export class AgentSession {
 		this.#loopGuards = new LoopGuards(streamGuardsHost);
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
+		if (config.continuationFactory) {
+			this.#bindContinuation(config.continuationFactory);
+			this.#continuationCompletionReady = this.#bindContinuationCompletionDelivery();
+		}
+		this.#continuationPreparation = config.continuationPreparation;
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
@@ -1581,6 +1668,16 @@ export class AgentSession {
 		// session and for subagents inheriting the process manager alike.
 		if (this.#asyncJobManager && this.#agentId) {
 			const manager = this.#asyncJobManager;
+			if (this.#continuationBinding) {
+				this.#unregisterJobAdmission = manager.registerJobAdmission(
+					this.#agentId,
+					this.#continuationBinding.admitJob,
+				);
+				this.#unregisterDeliveryAcceptance = manager.registerDeliveryAcceptance(
+					this.#agentId,
+					this.#continuationBinding.acceptDeliveries,
+				);
+			}
 			this.#unregisterAsyncDeliverySink = manager.registerDeliverySink(this.#agentId, (jobId, text, job) =>
 				this.#deliverAsyncJobResult(manager, jobId, text, job),
 			);
@@ -1701,6 +1798,7 @@ export class AgentSession {
 				this.#recovery.noteRetryFallbackCooldown(selector, retryAfterMs, errorMessage),
 			createCodexCompactionContext: createMaintenanceCodexCompactionContext,
 			sessionId: () => this.sessionId,
+			continuationBinding: () => this.#continuationBinding,
 		};
 		this.#advisors = new SessionAdvisors(advisorsHost, {
 			enabled: this.settings.get("advisor.enabled"),
@@ -1860,6 +1958,435 @@ export class AgentSession {
 
 	get asyncJobManager(): AsyncJobManager | undefined {
 		return this.#asyncJobManager;
+	}
+	get continuationFactory(): ContinuationBindingFactory | undefined {
+		return this.#continuationBinding?.factory;
+	}
+
+	/** Enrolled side-request stream; undefined when continuation is not bound. */
+	get inferenceStreamFn(): StreamFn | undefined {
+		return this.#continuationBinding ? this.#sideStreamFn : undefined;
+	}
+	#bindContinuation(factory: ContinuationBindingFactory): void {
+		const role = this.#agentKind === "sub" ? "worker" : "primary";
+		this.#installContinuationBinding(factory.bindSession(this.sessionManager, role));
+	}
+
+	#wrapContinuationBinding(binding: ContinuationSessionBinding): ContinuationSessionBinding {
+		const awaitReady = (): Promise<void> => this.#awaitContinuationCompletionReady();
+		return {
+			...binding,
+			requestBoundary: {
+				admit: async (request, signal) => {
+					await awaitReady();
+					return binding.requestBoundary.admit(request, signal);
+				},
+			},
+			toolBoundary: {
+				admit: async (context, signal) => {
+					await awaitReady();
+					return binding.toolBoundary.admit(context, signal);
+				},
+			},
+			admitJob: async intent => {
+				await awaitReady();
+				return binding.admitJob(intent);
+			},
+			beforeRecovery: async error => {
+				await awaitReady();
+				return binding.beforeRecovery(error);
+			},
+			forRole: (role, identity) => this.#wrapContinuationBinding(binding.forRole(role, identity)),
+		};
+	}
+
+	#installContinuationBinding(binding: ContinuationSessionBinding): void {
+		binding = this.#wrapContinuationBinding(binding);
+		if (!this.#continuationBaseStream) {
+			this.#continuationBaseStream = this.agent.streamFn;
+			this.agent.streamFn = async (...args) => {
+				await this.#persistContinuationInputs();
+				return this.#continuationStream!(...args);
+			};
+			this.#continuationBaseSideStream = this.#sideStreamFn;
+			this.#sideStreamFn = (...args) => this.#continuationSideStream!(...args);
+		}
+		this.#continuationBinding = binding;
+		this.#continuationStream = bindContinuationStream(
+			this.#continuationBaseStream,
+			binding.requestBoundary,
+			binding.role,
+		);
+		this.agent.setToolExecutionBoundary(binding.toolBoundary);
+		const maintenance = binding.forRole("maintenance", "maintenance");
+		this.#continuationSideStream = bindContinuationStream(
+			this.#continuationBaseSideStream!,
+			maintenance.requestBoundary,
+			maintenance.role,
+		);
+		this.#restoreContinuationInputs();
+		if (this.#asyncJobManager && this.#agentId && this.#unregisterJobAdmission) {
+			this.#unregisterJobAdmission();
+			this.#unregisterDeliveryAcceptance?.();
+			this.#unregisterJobAdmission = this.#asyncJobManager.registerJobAdmission(this.#agentId, binding.admitJob);
+			this.#unregisterDeliveryAcceptance = this.#asyncJobManager.registerDeliveryAcceptance(
+				this.#agentId,
+				binding.acceptDeliveries,
+			);
+		}
+	}
+
+	/**
+	 * Resolves when successor completion-delivery sinks are bound, or immediately
+	 * when this session has no continuation routing. `createAgentSession` awaits
+	 * this before returning; direct `new AgentSession` consumers must too before
+	 * prompting or admitting work.
+	 */
+	whenContinuationReady(): Promise<void> {
+		return this.#continuationCompletionReady;
+	}
+
+	async #awaitContinuationCompletionReady(): Promise<void> {
+		try {
+			await this.#continuationCompletionReady;
+		} catch (error) {
+			throw new ContinuationAdmissionError({
+				kind: "stop",
+				attention: true,
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#withContinuationInput<T>(work: () => Promise<T>): Promise<T> {
+		if (!this.#continuationBinding) return work();
+		if (this.#continuationCommitGate)
+			return this.#continuationCommitGate.then(() => this.#withContinuationInput(work));
+		const settled = Promise.withResolvers<void>();
+		this.#continuationInputs.add(settled.promise);
+		return work()
+			.then(async value => {
+				await this.#persistContinuationInputs();
+				return value;
+			})
+			.finally(() => {
+				this.#continuationInputs.delete(settled.promise);
+				settled.resolve();
+			});
+	}
+
+	#pendingContinuationInputs(): ContinuationInputSnapshot {
+		return {
+			version: 1,
+			sessionId: this.sessionId,
+			steering: [...this.agent.peekSteeringQueue()],
+			followUp: [...this.agent.peekFollowUpQueue()],
+			nextTurn: [...this.#pendingNextTurnMessages],
+			irc: this.#irc.capturePending(),
+		};
+	}
+
+	#persistContinuationInputs(): Promise<void> {
+		const work = this.#continuationInputWrites.then(async () => {
+			const binding = this.#continuationBinding;
+			if (!binding) return;
+			const snapshot = this.#pendingContinuationInputs();
+			const encoded = JSON.stringify(snapshot);
+			if (encoded === this.#continuationInputSnapshot) return;
+			this.sessionManager.appendCustomEntry("omp-continuation-inputs", snapshot);
+			await binding.barrier();
+			this.#continuationInputSnapshot = encoded;
+		});
+		this.#continuationInputWrites = work;
+		return work;
+	}
+
+	#restoreContinuationInputs(): void {
+		this.#continuationInputSnapshot = undefined;
+		this.#continuationInputWrites = Promise.resolve();
+		const entry = this.sessionManager
+			.getBranch()
+			.findLast(item => item.type === "custom" && item.customType === "omp-continuation-inputs");
+		if (!entry || entry.type !== "custom") return;
+		const snapshot = entry.data as ContinuationInputSnapshot;
+		if (
+			snapshot?.version !== 1 ||
+			snapshot.sessionId !== this.sessionId ||
+			!Array.isArray(snapshot.steering) ||
+			!Array.isArray(snapshot.followUp) ||
+			!Array.isArray(snapshot.nextTurn) ||
+			!Array.isArray(snapshot.irc?.interrupts) ||
+			!Array.isArray(snapshot.irc?.asides)
+		) {
+			throw new Error("Invalid persisted continuation input snapshot");
+		}
+		this.agent.replaceQueues(snapshot.steering, snapshot.followUp);
+		this.#pendingNextTurnMessages = snapshot.nextTurn;
+		this.#irc.clearPending();
+		this.#irc.restorePending(snapshot.irc);
+		this.#continuationInputSnapshot = JSON.stringify(snapshot);
+	}
+
+	async #captureContinuationInputs(options: ContinuationPreparationOptions): Promise<ContinuationHandoffInputs> {
+		if (!this.model) throw new Error("Continuation requires a resolved model");
+		const branch = this.sessionManager.getBranch();
+		let answeredThrough = branch.findLastIndex(
+			entry => entry.type === "custom" && entry.customType === "omp-continuation",
+		);
+		for (let index = answeredThrough + 1; index < branch.length; index++) {
+			const entry = branch[index]!;
+			if (entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "stop") {
+				answeredThrough = index;
+			}
+		}
+		const unanswered: AgentMessage[] = [];
+		for (let index = answeredThrough + 1; index < branch.length; index++) {
+			const entry = branch[index]!;
+			if (entry.type === "message" && (entry.message.role === "user" || entry.message.role === "developer")) {
+				unanswered.push(entry.message);
+			} else if (
+				entry.type === "custom_message" &&
+				(entry.attribution === "user" ||
+					entry.customType === ASYNC_RESULT_MESSAGE_TYPE ||
+					entry.customType === LAUNCH_COMPLETION_MESSAGE_TYPE)
+			) {
+				unanswered.push({
+					role: "custom",
+					customType: entry.customType,
+					content: entry.content,
+					details: entry.details,
+					display: entry.display,
+					attribution: entry.attribution ?? "agent",
+					timestamp: Date.parse(entry.timestamp),
+				});
+			}
+		}
+		const pending = [
+			...unanswered,
+			...this.agent.peekSteeringQueue(),
+			...this.agent.peekFollowUpQueue(),
+			...this.#pendingNextTurnMessages,
+			...this.#irc.peekPending(),
+		];
+		if (pending.some(message => !Number.isFinite(message.timestamp))) {
+			throw new Error("Pending continuation input has no valid ordering timestamp");
+		}
+		// Stable ties preserve the existing queue precedence; distinct ingress
+		// timestamps must not be reversed merely because their queue kinds differ.
+		pending.sort((left, right) => left.timestamp - right.timestamp);
+		const queuedMessages = await this.convertMessagesToLlm(pending);
+		if (queuedMessages.some(message => message.role !== "user" && message.role !== "developer")) {
+			throw new Error("Pending continuation inputs must be portable user or developer instructions");
+		}
+		return {
+			model: { ...this.model, headers: undefined },
+			context: {
+				systemPrompt: this.agent.state.systemPrompt,
+				messages: [],
+				tools: this.agent.state.tools.map(tool => ({
+					name: tool.name,
+					description: tool.description,
+					parameters: toolWireSchema(tool),
+					...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+					...(tool.customWireName ? { customWireName: tool.customWireName } : {}),
+				})),
+			},
+			retainedInstructions: options.retainedInstructions,
+			roleObligations: options.roleObligations,
+			discoveries: options.discoveries,
+			queuedMessages: queuedMessages.filter(message => message.role === "user" || message.role === "developer"),
+			draft: options.readDraft?.() ?? null,
+			maxBriefingBytes: options.maxBriefingBytes,
+			services: await captureContinuationServices(this.sessionManager.getCwd()),
+		};
+	}
+
+	async #continueAfterSourceExhaustion(): Promise<void> {
+		const options = this.#continuationPreparation;
+		if (!options || !this.#continuationBinding?.handoff || this.#isDisposed) return;
+		if (this.#automaticContinuation) return this.#automaticContinuation;
+		const continueWork = async () => {
+			while ((await this.#continuationBinding!.beforeRecovery()).kind === "handoff-required") {
+				await this.continueOnApprovedDestination(options);
+				const generation = this.#promptGeneration;
+				this.#scheduleAgentContinue({ source: "approved-continuation", generation });
+				await this.#waitForPostPromptRecovery(generation);
+			}
+		};
+		this.#automaticContinuation = continueWork();
+		try {
+			await this.#automaticContinuation;
+		} finally {
+			this.#automaticContinuation = undefined;
+		}
+	}
+
+	/** Try approved candidates in order; never retry a rejected or committed candidate implicitly. */
+	async continueOnApprovedDestination(
+		options: Omit<ContinuationPreparationOptions, "destination">,
+	): Promise<ContinuationActivatedHandoff> {
+		const handoff = this.#continuationBinding?.handoff;
+		if (!handoff) throw new Error("This session is not enrolled as a continuation primary");
+		const candidates = await handoff.candidates();
+		const rejected: string[] = [];
+		for (const destination of candidates) {
+			let prepared: ContinuationPreparedHandoff;
+			try {
+				prepared = await this.prepareContinuation({ ...options, destination });
+			} catch (error) {
+				if (!(error instanceof ContinuationDestinationRejection)) throw error;
+				rejected.push(error.message);
+				continue;
+			}
+			// Commit failures retain the prepared/committed owner; do not try another candidate.
+			return this.activateContinuation(prepared);
+		}
+		throw new Error(
+			`No approved continuation destination is usable${rejected.length ? `: ${rejected.join("; ")}` : ""}`,
+		);
+	}
+
+	/** Freeze admission, settle the source, and create an inert durable successor. */
+	async prepareContinuation(options: ContinuationPreparationOptions): Promise<ContinuationPreparedHandoff> {
+		const handoff = this.#continuationBinding?.handoff;
+		if (!handoff) throw new Error("This session is not enrolled as a continuation primary");
+		if (!Number.isSafeInteger(options.settlementTimeoutMs) || options.settlementTimeoutMs <= 0) {
+			throw new Error("Continuation requires an explicit positive settlementTimeoutMs");
+		}
+		const ticket = await handoff.begin(options.destination);
+		const drain = new AbortController();
+		try {
+			await withTimeout(
+				(async () => {
+					await this.waitForIdle();
+					drain.signal.throwIfAborted();
+					await this.#drainInFlightEventHandlers();
+					drain.signal.throwIfAborted();
+					await this.#settleContinuationAsyncWork();
+					drain.signal.throwIfAborted();
+					await this.#advisors.pauseForContinuation();
+					drain.signal.throwIfAborted();
+					await this.#irc.waitForReplies();
+					drain.signal.throwIfAborted();
+					while (this.#continuationInputs.size) {
+						await Promise.allSettled(this.#continuationInputs);
+						drain.signal.throwIfAborted();
+					}
+					await this.#bash.flushPending();
+					drain.signal.throwIfAborted();
+					await this.sessionManager.flush();
+				})(),
+				options.settlementTimeoutMs,
+				"Continuation settlement budget expired",
+			);
+			const prepared = await handoff.prepare(ticket, await this.#captureContinuationInputs(options));
+			this.#continuationPreparations.set(ticket.id, options);
+			return prepared;
+		} catch (error) {
+			drain.abort(error);
+			try {
+				await handoff.cancel(
+					ticket,
+					error instanceof Error ? error.message : String(error),
+					error instanceof ContinuationDestinationRejection,
+				);
+			} finally {
+				this.#advisors.reattachRecorderFeeds();
+			}
+			throw error;
+		}
+	}
+
+	async #settleContinuationAsyncWork(): Promise<void> {
+		const manager = this.#asyncJobManager;
+		if (!manager || !this.#agentId) return;
+		await manager.waitForOwnerJobs(this.#agentId);
+		await manager.drainDeliveries({ filter: { ownerId: this.#agentId } });
+		await this.waitForIdle();
+		await this.#drainInFlightEventHandlers();
+		const unconsumed = manager
+			.getAllJobs({ ownerId: this.#agentId })
+			.filter(job => job.status !== "running" && !manager.isJobResultConsumed(job.id));
+		if (unconsumed.length === 0) return;
+		const entries: AsyncResultEntry[] = [];
+		for (const job of unconsumed) {
+			entries.push({
+				jobId: job.id,
+				job,
+				epoch: this.#asyncDeliveryEpoch,
+				result: await this.#formatAsyncResultForFollowUp(job.errorText ?? job.resultText ?? job.status),
+				durationMs: Math.max(0, Date.now() - job.startTime),
+			});
+		}
+		// Suppressed/watched results still belong in the successor's pending input.
+		// Persist that input before consuming the manager's recoverable result.
+		const message = buildAsyncResultBatchMessage(entries);
+		if (!message) throw new Error("Continuation cannot consume work without a portable result");
+		this.#pendingNextTurnMessages.push(message);
+		await this.#persistContinuationInputs();
+		await manager.consumeJobResults(unconsumed.map(job => job.id));
+	}
+
+	/** Commit authority before using the common session-switch/reset machinery. */
+	async activateContinuation(prepared: ContinuationPreparedHandoff): Promise<ContinuationActivatedHandoff> {
+		const binding = this.#continuationBinding;
+		const options = this.#continuationPreparations.get(prepared.ticket.id);
+		if (!binding?.handoff || !options || this.#continuationCommitGate)
+			throw new Error("No locally prepared continuation is available");
+		const settled = Promise.withResolvers<void>();
+		const sourceSessionId = this.sessionManager.getSessionId();
+		this.#continuationCommitSourceSessionId = sourceSessionId;
+		this.#continuationCommitGate = settled.promise;
+		try {
+			while (this.#continuationInputs.size) await Promise.allSettled(this.#continuationInputs);
+			await this.#irc.waitForReplies();
+			await this.#continuationInputWrites;
+			await this.sessionManager.flush();
+			const captured = await this.#captureContinuationInputs(options);
+			const inputs = {
+				...captured,
+				services: stabilizeContinuationServices(prepared.services ?? [], captured.services),
+			};
+			const activated = await binding.handoff.commit(prepared, inputs);
+			this.#adoptingContinuation = true;
+			this.#providerSessionId = undefined;
+			const routing = buildContinuationCompletionRouting(
+				sourceSessionId,
+				activated.sessionId,
+				inputs.services,
+				this.sessionManager.getContinuationCompletionRouting(),
+			);
+			if (routing.routes.length > 0) {
+				await routeContinuationCompletions(this.sessionManager.getCwd(), routing);
+			}
+			if (!(await this.switchSession(activated.sessionFile)))
+				throw new Error("Committed successor could not be adopted; explicitly relaunch its recorded session");
+			this.#installContinuationBinding(binding.handoff.adopt(this.sessionManager));
+			this.#rebindQueuedLaunchCompletions(sourceSessionId, activated.sessionId);
+			await this.#deliverParkedLaunchCompletions(sourceSessionId, activated.sessionId);
+			await verifyContinuationServices(
+				this.sessionManager.getCwd(),
+				inputs.services.filter(service => !this.sessionManager.hasLaunchCompletionReceipt(service)),
+			);
+			this.#continuationCompletionReady = this.#bindContinuationCompletionDelivery();
+			await this.#continuationCompletionReady;
+			await this.#continuationBinding!.barrier();
+			this.#continuationPreparations.delete(prepared.ticket.id);
+			return activated;
+		} finally {
+			this.#adoptingContinuation = false;
+			const parkedSource = this.#continuationCommitSourceSessionId;
+			this.#continuationCommitGate = undefined;
+			this.#continuationCommitSourceSessionId = undefined;
+			settled.resolve();
+			if (
+				parkedSource &&
+				this.sessionManager.getSessionId() === parkedSource &&
+				this.#parkedLaunchCompletions.length > 0
+			) {
+				void this.#deliverParkedLaunchCompletions(parkedSource, parkedSource);
+			}
+		}
 	}
 
 	getAgentId(): string | undefined {
@@ -2686,6 +3213,13 @@ export class AgentSession {
 		// conversation to the replacement session.
 		if (this.#promptGeneration !== promptGeneration) return;
 		if (message.role === "hookMessage" || message.role === "custom") {
+			if (
+				message.role === "custom" &&
+				message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE &&
+				this.#launchCompletionDetailsAlreadyRecorded(message.details)
+			) {
+				return;
+			}
 			// One-run instructions must not return from persisted history: prewalk
 			// nudges are consumed once, and Vibe context is rebuilt only while active.
 			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
@@ -2695,9 +3229,6 @@ export class AgentSession {
 					message.display,
 					message.details,
 					message.attribution ?? "agent",
-					// Preserve the initiating message's own timestamp: the entry
-					// otherwise records emission time, which on rebuild excludes
-					// provider preparation / hook time from the prompt→yield anchor.
 					message.timestamp,
 				);
 			}
@@ -3143,6 +3674,14 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			// Not a tracked post-prompt task: preparation drains that set and must not await itself.
+			if (this.#continuationPreparation) {
+				queueMicrotask(() => {
+					void this.#continueAfterSourceExhaustion().catch(error => {
+						logger.error("approved continuation stopped", { error: String(error) });
+					});
+				});
+			}
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -4365,8 +4904,7 @@ export class AgentSession {
 	 * aside provider is detached. Idempotent; `dispose()` runs it first.
 	 *
 	 * Wrappers that await other teardown before delegating to `dispose()` MUST
-	 * call this before their first await — otherwise work started in that async
-	 * gap slips past the disposal guards.
+	 * call this first so those awaits cannot admit new work.
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
@@ -4380,6 +4918,14 @@ export class AgentSession {
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
+		this.#unregisterContinuationCompletions?.(true);
+		this.#unregisterContinuationCompletions = undefined;
+		this.#unregisterAsyncDeliverySink?.();
+		this.#unregisterAsyncDeliverySink = undefined;
+		for (const parked of this.#parkedLaunchCompletions) {
+			parked.reject(new Error("Session disposed before launch completion delivery"));
+		}
+		this.#parkedLaunchCompletions = [];
 		this.#irc.flushPending();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -4405,10 +4951,25 @@ export class AgentSession {
 	}
 
 	async #disposeOwnedAsyncJobs(): Promise<void> {
+		const binding = this.#continuationBinding;
+		const scopedManager = this.#asyncJobManager;
+		if (binding) {
+			if (scopedManager && this.#agentId) {
+				await scopedManager.waitForOwnerJobs(this.#agentId, { timeoutMs: 3_000 });
+			}
+			try {
+				await binding.dispose();
+			} catch (error) {
+				logger.warn("Continuation binding dispose failed", { error: String(error) });
+			}
+			this.#continuationBinding = undefined;
+			this.#unregisterJobAdmission?.();
+			this.#unregisterDeliveryAcceptance?.();
+			this.#unregisterJobAdmission = undefined;
+			this.#unregisterDeliveryAcceptance = undefined;
+		}
 		// Unregister before cancelling: a job completing during teardown must
 		// dead-letter rather than enqueue a follow-up into a disposing session.
-		this.#unregisterAsyncDeliverySink?.();
-		this.#unregisterAsyncDeliverySink = undefined;
 		const manager = this.#ownedAsyncJobManager;
 		// The shutdown reason is reserved for the top-level session that OWNS the
 		// manager — the genuine process/handled-shutdown path — so the task
@@ -4710,6 +5271,7 @@ export class AgentSession {
 		// after the boundary and re-enter the supposedly empty context. The
 		// sibling boundary op (branchFromBtw) guards on the same predicates.
 		if (this.isStreaming || this.isBashRunning || this.isEvalRunning) return undefined;
+		this.#continuationBinding?.assertSessionTransition("reset");
 		const droppedCount = this.agent.state.messages.length;
 
 		// Tear down the same per-turn runtime state that newSession() resets across
@@ -5916,6 +6478,12 @@ export class AgentSession {
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const accepted = await this.#withContinuationInput(() => this.#promptContinuationInput(text, options));
+		await this.#continueAfterSourceExhaustion();
+		return accepted;
+	}
+
+	async #promptContinuationInput(text: string, options?: PromptOptions): Promise<boolean> {
 		// Stamp the operator's submission instant before ANY async preprocessing —
 		// command execution, image normalization, vision-model description — so the
 		// prompt→yield delta includes the whole wait, whatever path the prompt takes.
@@ -6116,6 +6684,18 @@ export class AgentSession {
 			queueOnly?: boolean;
 		},
 	): Promise<boolean> {
+		const accepted = await this.#withContinuationInput(() => this.#promptCustomContinuationInput(message, options));
+		await this.#continueAfterSourceExhaustion();
+		return accepted;
+	}
+
+	async #promptCustomContinuationInput<T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
+			queueChipText?: string;
+			queueOnly?: boolean;
+		},
+	): Promise<boolean> {
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -6183,10 +6763,9 @@ export class AgentSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck" | "acceptTerminalEmptyStop"> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
-			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -6588,6 +7167,10 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		return this.#withContinuationInput(() => this.#steerContinuationInput(text, images));
+	}
+
+	async #steerContinuationInput(text: string, images?: ImageContent[]): Promise<void> {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -6607,6 +7190,10 @@ export class AgentSession {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		return this.#withContinuationInput(() => this.#followUpContinuationInput(text, images, options));
+	}
+
+	async #followUpContinuationInput(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -6815,12 +7402,154 @@ export class AgentSession {
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
+		if (
+			this.#continuationCommitGate &&
+			this.#continuationCommitSourceSessionId !== undefined &&
+			this.sessionManager.getSessionId() === this.#continuationCommitSourceSessionId
+		) {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			this.#parkedLaunchCompletions.push({ notification, resolve, reject });
+			return promise;
+		}
+		if (!this.#isDeliverableLaunchCompletion(notification)) {
+			return Promise.reject(new Error("Launch completion does not belong to this session"));
+		}
+		const key = launchCompletionGenerationKey(notification.daemon);
+		const inFlight = this.#inFlightLaunchCompletions.get(key);
+		if (inFlight) return inFlight;
+		if (this.#hasLaunchCompletionReceipt(notification.daemon)) return this.#flushLaunchCompletionReceipt();
+		const work = this.#deliverLaunchCompletion(notification).finally(() => {
+			if (this.#inFlightLaunchCompletions.get(key) === work) this.#inFlightLaunchCompletions.delete(key);
+		});
+		this.#inFlightLaunchCompletions.set(key, work);
+		return work;
+	}
+
+	#hasLaunchCompletionReceipt(daemon: { id: string; startedAt: number }): boolean {
+		return this.sessionManager.hasLaunchCompletionReceipt(daemon);
+	}
+
+	#launchCompletionDetailsAlreadyRecorded(details: unknown): boolean {
+		if (
+			!details ||
+			typeof details !== "object" ||
+			!("daemons" in details) ||
+			!Array.isArray(details.daemons) ||
+			details.daemons.length === 0
+		) {
+			return false;
+		}
+		return details.daemons.every(item => {
+			if (!item || typeof item !== "object" || !("id" in item) || !("startedAt" in item)) return false;
+			if (typeof item.id !== "string" || typeof item.startedAt !== "number") return false;
+			return this.sessionManager.hasLaunchCompletionReceipt({ id: item.id, startedAt: item.startedAt });
+		});
+	}
+
+	async #deliverLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
+		if (this.#hasLaunchCompletionReceipt(notification.daemon)) return this.#flushLaunchCompletionReceipt();
 		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
 			notification,
 		);
 		this.yieldQueue.requestIdleFlush();
-		return delivered;
+		try {
+			await delivered;
+		} catch {
+			// Inject may skip when idle flush cannot run; still persist the receipt before ack.
+		}
+		const injected = this.agent.state.messages.findLast(
+			message =>
+				message.role === "custom" &&
+				message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE &&
+				launchCompletionDetailsContainDaemon(message.details, notification.daemon),
+		);
+		if (injected) await this.#waitForSessionMessagePersistence(injected);
+		if (!this.#hasLaunchCompletionReceipt(notification.daemon)) {
+			const message = buildLaunchCompletionBatchMessage([notification]);
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+				message.attribution,
+				message.timestamp,
+			);
+		}
+		await this.#flushLaunchCompletionReceipt();
+	}
+
+	async #flushLaunchCompletionReceipt(): Promise<void> {
+		await this.sessionManager.flush();
+		await this.#continuationBinding?.barrier();
+	}
+
+	#isDeliverableLaunchCompletion(entry: LaunchCompletionEntry): boolean {
+		const sessionId = this.sessionManager.getSessionId();
+		if (isLaunchCompletionOwner(entry.owner, sessionId)) return true;
+		const routing = this.sessionManager.getContinuationCompletionRouting();
+		if (!routing || routing.successorSessionId !== sessionId) return false;
+		return routing.routes.some(
+			route =>
+				route.fromOwner === entry.owner &&
+				route.id === entry.daemon.id &&
+				route.name === entry.daemon.name &&
+				route.startedAt === entry.daemon.startedAt,
+		);
+	}
+
+	#rebindQueuedLaunchCompletions(sourceSessionId: string, successorSessionId: string): void {
+		this.yieldQueue.rewrite<LaunchCompletionEntry>(LAUNCH_COMPLETION_MESSAGE_TYPE, entry =>
+			rebindLaunchCompletionOwner(entry, sourceSessionId, successorSessionId),
+		);
+	}
+
+	async #deliverParkedLaunchCompletions(sourceSessionId: string, successorSessionId: string): Promise<void> {
+		const parked = this.#parkedLaunchCompletions;
+		this.#parkedLaunchCompletions = [];
+		for (const item of parked) {
+			if (this.#isDisposed) {
+				item.reject(new Error("Session disposed before launch completion delivery"));
+				continue;
+			}
+			try {
+				await this.queueLaunchCompletion(
+					rebindLaunchCompletionOwner(item.notification, sourceSessionId, successorSessionId),
+				);
+				item.resolve();
+			} catch (error) {
+				item.reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		}
+	}
+
+	async #bindContinuationCompletionDelivery(): Promise<void> {
+		this.#unregisterContinuationCompletions?.(true);
+		this.#unregisterContinuationCompletions = undefined;
+		const routing = this.sessionManager.getContinuationCompletionRouting();
+		if (!routing || routing.routes.length === 0) return;
+		if (routing.successorSessionId !== this.sessionManager.getSessionId()) return;
+		const pendingRouting = {
+			...routing,
+			routes: routing.routes.filter(route => !this.sessionManager.hasLaunchCompletionReceipt(route)),
+		};
+		if (pendingRouting.routes.length > 0) {
+			await routeContinuationCompletions(this.sessionManager.getCwd(), pendingRouting);
+		}
+		const owners: string[] = [];
+		for (const route of routing.routes) {
+			if (!owners.includes(route.toOwner)) owners.push(route.toOwner);
+			// A durable session receipt may precede the broker ACK, including a
+			// parked source notification. Subscribe both identities to re-ACK it.
+			if (this.sessionManager.hasLaunchCompletionReceipt(route) && !owners.includes(route.fromOwner)) {
+				owners.push(route.fromOwner);
+			}
+		}
+		this.#unregisterContinuationCompletions = await bindContinuationCompletionOwners(
+			this.sessionManager.getCwd(),
+			owners,
+			notification => this.queueLaunchCompletion(notification),
+		);
 	}
 
 	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
@@ -7007,6 +7736,13 @@ export class AgentSession {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
+		return this.#withContinuationInput(() => this.#sendContinuationCustomMessage(message, options));
+	}
+
+	async #sendContinuationCustomMessage<T>(
+		message: CustomMessagePayload<T>,
+		options?: Parameters<AgentSession["sendCustomMessage"]>[1],
+	): Promise<boolean> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
 		const sessionGeneration = this.#sessionGeneration;
 		const normalizedPayload = normalizeCustomMessagePayload<T>(message);
@@ -7135,6 +7871,14 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" | "aside" },
 	): Promise<void> {
+		await this.#withContinuationInput(() => this.#sendUserContinuationInput(content, options));
+		await this.#continueAfterSourceExhaustion();
+	}
+
+	async #sendUserContinuationInput(
+		content: string | (TextContent | ImageContent)[],
+		options?: { deliverAs?: "steer" | "followUp" | "aside" },
+	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -7179,7 +7923,7 @@ export class AgentSession {
 		// `streamingBehavior` when it does. Passing "aside" through (instead of hard-coding
 		// "steer") keeps that race from degrading a non-interrupting aside into a
 		// tool-batch-aborting steer.
-		await this.prompt(text, {
+		await this.#promptContinuationInput(text, {
 			expandPromptTemplates: false,
 			images,
 			streamingBehavior: deliveredAsAside ? "aside" : "steer",
@@ -7423,6 +8167,7 @@ export class AgentSession {
 			customSystemPrompt ?? this.#titleSystemPrompt,
 			this.#titleGenerationAbortController.signal,
 			parentSessionId,
+			this.inferenceStreamFn,
 		);
 	}
 
@@ -7565,6 +8310,7 @@ export class AgentSession {
 	async newSession(options?: NewSessionOptions): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("start a new session");
 		const previousSessionFile = this.sessionFile;
+		this.#continuationBinding?.assertSessionTransition("new");
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
 		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -7694,6 +8440,7 @@ export class AgentSession {
 	async fork(): Promise<boolean> {
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const previousSessionFile = this.sessionFile;
+		this.#continuationBinding?.assertSessionTransition("fork");
 		const previousSessionId = this.sessionManager.getSessionId();
 
 		// Emit session_before_switch event with reason "fork" (can be cancelled)
@@ -7766,6 +8513,7 @@ export class AgentSession {
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
+		this.#continuationBinding?.assertSessionTransition("move");
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
 
@@ -8711,12 +9459,13 @@ export class AgentSession {
 			preserveLocalCwd?: boolean;
 		},
 	): Promise<boolean> {
+		this.#continuationBinding?.assertSessionTransition("switch", sessionPath);
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
 		// Emit session_before_switch event (can be cancelled)
-		if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
+		if (!this.#adoptingContinuation && this.#extensionRunner?.hasHandlers("session_before_switch")) {
 			const result = (await this.#extensionRunner.emit({
 				type: "session_before_switch",
 				reason: "resume",
@@ -8730,7 +9479,7 @@ export class AgentSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
+		if (!this.#adoptingContinuation) await this.#sessionBeforeSwitchReconciler?.();
 
 		await this.#bash.flushPending();
 		// Flush pending writes before switching so restore snapshots reflect committed state.
@@ -8839,7 +9588,7 @@ export class AgentSession {
 			this.#rehydrateCheckpointRewindState();
 
 			// Emit session_switch event to hooks
-			if (this.#extensionRunner) {
+			if (!this.#adoptingContinuation && this.#extensionRunner) {
 				await this.#extensionRunner.emit({
 					type: "session_switch",
 					reason: "resume",
@@ -8939,7 +9688,7 @@ export class AgentSession {
 			}
 			this.#reconnectToAgent();
 			try {
-				await this.#sessionSwitchReconciler?.();
+				if (!this.#adoptingContinuation) await this.#sessionSwitchReconciler?.();
 			} catch (error) {
 				logger.warn("Failed to reconcile session mode after switch", {
 					targetSessionFile: sessionPath,

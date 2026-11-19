@@ -40,6 +40,8 @@ import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SessionManager } from "./session-manager";
+import type { ContinuationBindingFactory } from "./continuation-binding";
+import type { ContinuationPreparationOptions } from "./continuation-handoff";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
 export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
@@ -323,6 +325,13 @@ export interface AgentSessionConfig {
 	disconnectOwnedMcpManager?: () => Promise<void>;
 	/** System prompt used by automatic session-title generation. */
 	titleSystemPrompt?: string;
+	/**
+	 * Explicit continuation enrollment. Absent keeps ordinary sessions unchanged.
+	 * Bound only after SessionManager exists; never implied by workflow registration.
+	 */
+	continuationFactory?: ContinuationBindingFactory;
+	/** Explicit opt-in to fresh approved continuation after source exhaustion. */
+	continuationPreparation?: Omit<ContinuationPreparationOptions, "destination">;
 }
 
 /** Options for AgentSession.prompt(). */
@@ -345,6 +354,8 @@ export interface PromptOptions {
 	attribution?: MessageAttribution;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
+	/** Accept a terminal empty stop for this prompt instead of issuing recovery requests. */
+	acceptTerminalEmptyStop?: boolean;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled

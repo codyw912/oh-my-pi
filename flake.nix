@@ -171,8 +171,60 @@
               patchedSjujperpowers = pkgs.applyPatches {
                 name = "sjujperpowers-onboarding";
                 src = sjujperpowers;
-                patches = [ ./nix/patches/sjujperpowers-backend-onboarding.patch ];
+                patches = [
+                  ./nix/patches/sjujperpowers-backend-onboarding.patch
+                  ./nix/patches/sjujperpowers-continuation-recovery.patch
+                ];
               };
+              durabilityTestFiles = [
+                "packages/coding-agent/test/continuation-store.test.ts"
+                "packages/coding-agent/test/session-storage.test.ts"
+                "packages/coding-agent/test/session-manager-close-race.test.ts"
+                "packages/coding-agent/test/session-manager/stage-continuation.test.ts"
+                "packages/agent/test/tool-execution-boundary.test.ts"
+                "packages/coding-agent/test/async-job-manager.test.ts"
+              ];
+              baselineTestFiles = [
+                "packages/utils/test/file-lock.test.ts"
+                "packages/natives/test/file-lock.test.ts"
+                "packages/coding-agent/test/session-storage.test.ts"
+                "packages/coding-agent/test/agent-session-new-session-boundary.test.ts"
+                "packages/coding-agent/test/session-manager/new-session-boundary.test.ts"
+              ];
+              admissionTestFiles = durabilityTestFiles ++ [
+                "packages/coding-agent/test/continuation-policy.test.ts"
+                "packages/coding-agent/test/continuation-request.test.ts"
+                "packages/coding-agent/test/continuation-controller.test.ts"
+                "packages/coding-agent/test/continuation-admission-matrix.test.ts"
+                "packages/coding-agent/test/agent-session-continuation-admission.test.ts"
+                "packages/coding-agent/test/continuation-auxiliary.test.ts"
+                "packages/coding-agent/test/continuation-briefing.test.ts"
+                "packages/coding-agent/test/continuation-evaluation.test.ts"
+              ];
+              handoffTestFiles = [
+                "packages/coding-agent/test/agent-session-continuation.test.ts"
+                "packages/coding-agent/test/session-manager/stage-continuation.test.ts"
+                "packages/coding-agent/test/advisor/advisor.test.ts"
+                "packages/coding-agent/test/session-stop-continuation-recap.test.ts"
+                "packages/coding-agent/test/continuation-services.test.ts"
+                "packages/coding-agent/test/continuation-advisor.test.ts"
+                "packages/coding-agent/test/launch"
+                "packages/coding-agent/test/tools/hub/launch-compat.test.ts"
+                "packages/coding-agent/test/agent-session-async-delivery.test.ts"
+                "packages/coding-agent/test/async-yield-queue.test.ts"
+              ];
+              compactionTestFiles = [
+                "packages/coding-agent/test/session-manager/build-context.test.ts"
+                "packages/coding-agent/test/agent-session-eager-compaction.test.ts"
+                "packages/coding-agent/test/agent-session-mid-turn-compaction-dead-end.test.ts"
+                "packages/coding-agent/test/agent-session-compaction-cancellation.test.ts"
+                "packages/coding-agent/test/agent-session-auto-compaction-progress-guard.test.ts"
+                "packages/coding-agent/test/agent-session-auto-compaction-queue.test.ts"
+                "packages/coding-agent/test/agent-session-goal-midrun-compaction.test.ts"
+                "packages/coding-agent/test/compaction-speculation.test.ts"
+                "packages/coding-agent/test/compaction-lifecycle.test.ts"
+                "packages/coding-agent/test/compaction.test.ts"
+              ];
               continuationCheck =
                 args:
                 pkgs.callPackage ./nix/continuation-local-check.nix (
@@ -190,30 +242,37 @@
               continuation-baseline = continuationCheck {
                 pname = "omp-continuation-baseline";
                 runBaseline = true;
-                testFiles = [
-                  "packages/utils/test/file-lock.test.ts"
-                  "packages/natives/test/file-lock.test.ts"
-                  "packages/coding-agent/test/session-storage.test.ts"
-                  "packages/coding-agent/test/agent-session-new-session-boundary.test.ts"
-                  "packages/coding-agent/test/session-manager/new-session-boundary.test.ts"
-                ];
+                testFiles = baselineTestFiles;
               };
-            }
-            // lib.optionalAttrs (
-              builtins.pathExists ./packages/coding-agent/test/agent-session-continuation.test.ts
-            ) {
+              continuation-durability = continuationCheck {
+                pname = "omp-continuation-durability";
+                testFiles = durabilityTestFiles;
+              };
+              continuation-admission = continuationCheck {
+                pname = "omp-continuation-admission";
+                testFiles = admissionTestFiles;
+              };
               continuation-handoff = continuationCheck {
                 pname = "omp-continuation-handoff";
-                testFiles = [ "packages/coding-agent/test/agent-session-continuation.test.ts" ];
+                testFiles = handoffTestFiles;
+              };
+              continuation-local = continuationCheck {
+                pname = "omp-continuation-local";
+                kata = pkgs.callPackage ./nix/continuation-kata.nix { };
+                runWorkflowTests = true;
+                testFiles = lib.unique (
+                  admissionTestFiles
+                  ++ handoffTestFiles
+                  ++ compactionTestFiles
+                  ++ baselineTestFiles
+                  ++ [
+                    "packages/coding-agent/test/continuation-local.test.ts"
+                    "packages/coding-agent/test/continuation-kata.test.ts"
+                    "packages/coding-agent/test/continuation-owner-certification.test.ts"
+                  ]
+                );
               };
             }
-            // lib.optionalAttrs (builtins.pathExists ./packages/coding-agent/test/continuation-local.test.ts)
-              {
-                continuation-local = continuationCheck {
-                  pname = "omp-continuation-local";
-                  testFiles = [ "packages/coding-agent/test/continuation-local.test.ts" ];
-                };
-              }
           );
         in
         {

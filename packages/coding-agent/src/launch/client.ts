@@ -14,6 +14,7 @@ import {
 	type DaemonCompletionNotification,
 	type DaemonOperation,
 	type DaemonRpcResult,
+	type DaemonSnapshot,
 	type DaemonWireMessage,
 	parseDaemonRpcResult,
 	parseDaemonWireMessage,
@@ -42,6 +43,8 @@ export interface DaemonBrokerClientOptions {
 	runtimeDir?: string;
 	/** Last-client shutdown grace override in milliseconds. */
 	idleGraceMs?: number;
+	/** When false, connect only to a live broker and never spawn one. */
+	spawnIfMissing?: boolean;
 }
 
 export interface DaemonCompletionUnregisterOptions {
@@ -139,6 +142,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly #token: string;
 	readonly #seenCompletionIds = new Set<string>();
 	readonly #idleGraceMs: number | undefined;
+	readonly #spawnIfMissing: boolean;
 	readonly #pending = new Map<string, PendingRequest>();
 	readonly #completionSinks = new Map<string, (notification: DaemonCompletionNotification) => Promise<void> | void>();
 	readonly #completionUnsubscribes = new Set<string>();
@@ -158,9 +162,22 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
 		this.#token = token;
 		this.#idleGraceMs = options.idleGraceMs;
+		this.#spawnIfMissing = options.spawnIfMissing !== false;
+	}
+
+	get connected(): boolean {
+		return this.#socket !== undefined && !this.#socket.destroyed;
 	}
 
 	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
+		return this.#request(operation, signal);
+	}
+
+	async #request(
+		operation: DaemonOperation,
+		signal?: AbortSignal,
+		completionAcks?: string[],
+	): Promise<DaemonRpcResult> {
 		if (this.#closed) throw new Error("Daemon broker client is closed");
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
 		await this.#connect();
@@ -198,6 +215,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 				completionEvents: true,
 				completionUnsubscribes,
 				completionReplays,
+				completionAcks,
 				completionSubscriptionId: this.#completionSubscriptionId,
 				operation,
 			})}\n`,
@@ -287,6 +305,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			this.#bindSocket(await openSocket(this.#endpoint, 250));
 			return;
 		} catch {
+			if (!this.#spawnIfMissing) throw new Error("Daemon broker is not running");
 			// No live broker. Multiple clients may race to spawn; the broker's PID
 			// lease selects one winner before any candidate touches the socket.
 		}
@@ -393,24 +412,22 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	async #deliverCompletion(message: DaemonCompletionNotification): Promise<void> {
-		if (this.#seenCompletionIds.has(message.completionId)) {
-			this.#ackCompletion(message.completionId);
-			return;
-		}
+		// Keep ACKs inside the tracked request lifecycle. A failed broker fsync
+		// must reconnect and replay, not become a silently ignored ping response.
 		if (this.#inFlightCompletionIds.has(message.completionId)) return;
 		const sink = this.#completionSinks.get(message.owner);
 		if (!sink) return;
 		this.#inFlightCompletionIds.add(message.completionId);
 		try {
-			await sink(message);
+			if (!this.#seenCompletionIds.has(message.completionId)) await sink(message);
+			await this.#request({ op: "ping" }, undefined, [message.completionId]);
 			if (this.#seenCompletionIds.size >= 512) {
 				const oldest = this.#seenCompletionIds.values().next().value;
 				if (oldest !== undefined) this.#seenCompletionIds.delete(oldest);
 			}
 			this.#seenCompletionIds.add(message.completionId);
-			this.#ackCompletion(message.completionId);
 		} catch (error) {
-			logger.warn("Daemon completion sink failed", {
+			logger.warn("Daemon completion delivery or acknowledgment failed", {
 				owner: message.owner,
 				completionId: message.completionId,
 				error: error instanceof Error ? error.message : String(error),
@@ -419,24 +436,6 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		} finally {
 			this.#inFlightCompletionIds.delete(message.completionId);
 		}
-	}
-
-	#ackCompletion(completionId: string): void {
-		const socket = this.#socket;
-		if (!socket || socket.destroyed) return;
-		socket.write(
-			`${JSON.stringify({
-				id: crypto.randomUUID(),
-				token: this.#token,
-				owners: [...this.#completionSinks.keys()],
-				detachedOwners: [...this.#preservedCompletionOwners],
-				completionEvents: true,
-				completionAcks: [completionId],
-				completionUnsubscribes: [...this.#completionUnsubscribes],
-				completionSubscriptionId: this.#completionSubscriptionId,
-				operation: { op: "ping" },
-			})}\n`,
-		);
 	}
 
 	#rejectPending(error: Error): void {
@@ -479,6 +478,53 @@ export async function createDaemonBrokerClient(
 export async function daemonClientForProject(projectDir: string): Promise<DaemonBrokerClient> {
 	const canonical = await canonicalProjectDir(projectDir);
 	return sharedDaemonClient(`project:${canonical}`, () => createDaemonBrokerClient(canonical));
+}
+
+/** Process-shared project broker client if this process already holds a live socket. */
+export async function existingDaemonClientForProject(projectDir: string): Promise<DaemonBrokerClient | undefined> {
+	const canonical = await canonicalProjectDir(projectDir);
+	const pending = sharedClients.get(`project:${canonical}`);
+	if (!pending) return undefined;
+	try {
+		const client = await pending;
+		return client instanceof SocketDaemonClient && client.connected ? client : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * List daemons and pending completions on a live project broker without starting
+ * one. Undefined when no broker is available to this process. Rejects when a
+ * live broker cannot report pending completion notifications.
+ */
+export interface ProjectDaemonInspection {
+	daemons: DaemonSnapshot[];
+	pendingCompletions: DaemonCompletionNotification[];
+}
+
+export async function inspectProjectDaemons(projectDir: string): Promise<ProjectDaemonInspection | undefined> {
+	const canonical = await canonicalProjectDir(projectDir);
+	const runtimeDir = daemonRuntimeDir(canonical);
+	try {
+		const socket = await openSocket(daemonBrokerEndpoint(canonical, runtimeDir), 250);
+		socket.destroy();
+	} catch {
+		return undefined;
+	}
+	const client = await createDaemonBrokerClient(canonical, { spawnIfMissing: false });
+	try {
+		const result = await client.request({ op: "list" });
+		if (result.op !== "list" || result.pendingCompletions === undefined) {
+			throw new Error("Continued project service access could not be established");
+		}
+		return { daemons: result.daemons, pendingCompletions: result.pendingCompletions };
+	} catch (error) {
+		if (error instanceof Error && error.message === "Daemon broker is not running") return undefined;
+		throw new Error("Continued project service access could not be established");
+	} finally {
+		client.close();
+	}
 }
 
 /** Get the process-shared client that leases one profile-independent, machine-global daemon broker. */

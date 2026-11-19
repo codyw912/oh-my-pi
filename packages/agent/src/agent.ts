@@ -53,8 +53,10 @@ import type {
 	StreamFn,
 	ToolCallContext,
 	ToolChoiceDirective,
+	ToolExecutionAdmission,
+	ToolExecutionBoundary,
 } from "./types";
-import { isSoftToolRequirement } from "./types";
+import { isSoftToolRequirement, ToolExecutionBoundaryError } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
@@ -334,6 +336,11 @@ export interface AgentOptions {
 	 * across turns so DeepSeek/Anthropic prefix caches hit at maximum rate.
 	 */
 	appendOnlyContext?: AppendOnlyContextManager;
+	/**
+	 * Optional fail-closed admission/settlement seam at actual tool invocation.
+	 * See {@link Agent.setToolExecutionBoundary}. Ordinary sessions omit this.
+	 */
+	toolExecutionBoundary?: ToolExecutionBoundary;
 }
 
 export interface AgentPromptOptions {
@@ -428,6 +435,8 @@ export class Agent {
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
+	#toolExecutionBoundary?: ToolExecutionBoundary;
+	#toolExecutionBoundaryError?: ToolExecutionBoundaryError;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 
@@ -510,6 +519,7 @@ export class Agent {
 		this.transformAssistantMessage = opts.transformAssistantMessage;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
+		this.#toolExecutionBoundary = opts.toolExecutionBoundary;
 		this.#transformProviderContext = opts.transformProviderContext;
 	}
 
@@ -873,6 +883,66 @@ export class Agent {
 	 */
 	setBeforeModelCall(fn: AgentBeforeModelCall | undefined): void {
 		this.#beforeModelCall = fn;
+	}
+
+	/**
+	 * Bind or replace the tool execution boundary for this Agent. Passing a new
+	 * value (including `undefined`) clears a latched {@link ToolExecutionBoundaryError}.
+	 * Explicit rebind is the reset seam; {@link reset} does not clear the latch.
+	 */
+	setToolExecutionBoundary(boundary?: ToolExecutionBoundary): void {
+		this.#toolExecutionBoundary = boundary;
+		this.#toolExecutionBoundaryError = undefined;
+	}
+
+	/** Latched terminal boundary fault, if any. Cleared only by {@link setToolExecutionBoundary}. */
+	get toolExecutionBoundaryError(): ToolExecutionBoundaryError | undefined {
+		return this.#toolExecutionBoundaryError;
+	}
+
+	#latchToolExecutionBoundary(error: unknown): ToolExecutionBoundaryError {
+		const fault =
+			error instanceof ToolExecutionBoundaryError
+				? error
+				: new ToolExecutionBoundaryError(
+						error instanceof Error && error.message.length > 0 ? error.message : "Tool execution boundary failed",
+						{ cause: error },
+					);
+		if (!fault.persistent) return fault;
+		this.#toolExecutionBoundaryError ??= fault;
+		return this.#toolExecutionBoundaryError;
+	}
+
+	#bindToolExecutionBoundary(): ToolExecutionBoundary | undefined {
+		if (!this.#toolExecutionBoundary && !this.#toolExecutionBoundaryError) return undefined;
+		return {
+			admit: async (context, signal) => {
+				if (this.#toolExecutionBoundaryError) throw this.#toolExecutionBoundaryError;
+				const boundary = this.#toolExecutionBoundary;
+				if (!boundary) {
+					throw this.#latchToolExecutionBoundary(new ToolExecutionBoundaryError());
+				}
+				let admission: ToolExecutionAdmission;
+				try {
+					admission = await boundary.admit(context, signal);
+				} catch (error) {
+					throw this.#latchToolExecutionBoundary(error);
+				}
+				return {
+					settle: async outcome => {
+						try {
+							await admission.settle(outcome);
+						} catch (error) {
+							throw this.#latchToolExecutionBoundary(
+								error instanceof ToolExecutionBoundaryError && !error.persistent
+									? new ToolExecutionBoundaryError(error.message, { cause: error })
+									: error,
+							);
+						}
+					},
+				};
+			},
+		};
 	}
 
 	/**
@@ -1469,6 +1539,7 @@ export class Agent {
 			appendOnlyContext: this.#appendOnlyContext,
 			beforeToolCall: this.beforeToolCall ? (ctx, signal) => this.beforeToolCall?.(ctx, signal) : undefined,
 			afterToolCall: this.afterToolCall ? (ctx, signal) => this.afterToolCall?.(ctx, signal) : undefined,
+			toolExecutionBoundary: this.#bindToolExecutionBoundary(),
 			transformAssistantMessage: this.transformAssistantMessage
 				? (message, signal) => this.transformAssistantMessage?.(message, signal)
 				: undefined,
@@ -1702,6 +1773,10 @@ export class Agent {
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
 				this.#emit({ type: "agent_end", messages: [errorMsg] });
+			}
+			if (err instanceof ToolExecutionBoundaryError) {
+				if (err.persistent) this.#toolExecutionBoundaryError ??= err;
+				throw err;
 			}
 		} finally {
 			resolveRun?.();

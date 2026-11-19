@@ -1995,6 +1995,7 @@ function mapOptionsForApi<TApi extends Api>(
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
+		providerRetryWait: options?.providerRetryWait,
 		metadata: options?.metadata,
 		taskBudget: options?.taskBudget,
 		sessionId: options?.sessionId,

@@ -22,6 +22,7 @@ import * as path from "node:path";
 import type * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { AgentRegistry } from "../registry/agent-registry";
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 import type { ToolSession } from "../tools";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -128,7 +129,8 @@ export function makeIsolationCommitMessage(session: ToolSession): BuildCommitMes
 		const registry = session.modelRegistry;
 		const settings = session.settings;
 		const sessionId = session.getSessionId?.() ?? undefined;
-		return async (diff: string) => generateCommitMessage(diff, registry, settings, sessionId);
+		const completeImpl = completeImplFromEnrollment(session.inferenceStreamFn, Boolean(session.continuationFactory));
+		return async (diff: string) => generateCommitMessage(diff, registry, settings, sessionId, completeImpl);
 	};
 }
 

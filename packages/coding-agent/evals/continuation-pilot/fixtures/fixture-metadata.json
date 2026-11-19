@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "id": "refund-idempotency-review",
+  "planPath": "docs/project/plans/refund-idempotency.md",
+  "goal": "Screen whether focused continuation preserves useful unfinished-review work compared with ordinary source continuation and compatible full-history destination fallback.",
+  "unitOfEvaluation": "One continuation from the shared frozen source primer and completed implementation.",
+  "objectiveAcceptance": [
+    "Frozen source and project evidence remain unchanged.",
+    "A review is submitted with genuine probe citations and no fabricated evidence IDs.",
+    "A cited actual service response demonstrates the scope mismatch."
+  ],
+  "humanAcceptance": [
+    "The report identifies the observed defect accurately without unsupported impact claims.",
+    "The recommendation preserves valid same-scope retry semantics.",
+    "Completed implementation is not repeated or replaced."
+  ],
+  "measurementLimits": [
+    "Two repetitions and one intentionally small workload do not establish general quality non-inferiority or a long-term maintenance decision.",
+    "Scripted responses prove execution/control flow only; they are not model competence, latency, billed-cost or allowance measurements.",
+    "Advertised model IDs do not identify immutable backend revisions or prove current account availability.",
+    "No cache-retention changes or paid/model judging are part of this pilot."
+  ],
+  "livePrerequisite": "A separately verified, authorized single-upstream-attempt route with no hidden retries, credential rotation or fallback.",
+  "modelVisibleWorkspace": [
+    "app/refund-service.mjs",
+    "checks/visible-checks.mjs",
+    "docs/project/plans/refund-idempotency.md",
+    "docs/project/specs/refund-api.md",
+    "docs/project/evidence/task-1-completion.md"
+  ],
+  "excludedFromModelTools": [
+    "fixtures/review-rubric.json",
+    "fixtures/fixture-metadata.json",
+    "runner.ts",
+    "contract.ts"
+  ],
+  "visibleCheck": "checks/visible-checks.mjs",
+  "reviewArtifact": "in-memory submission retained by workload verification",
+  "conditions": {
+    "sourcePrimer": "one shared real transcript",
+    "continuations": 6,
+    "repetitionsPerStrategy": 2,
+    "strategies": ["ordinary", "focused", "full-history"]
+  }
+}

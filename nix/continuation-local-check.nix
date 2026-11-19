@@ -3,6 +3,8 @@
   stdenv,
   bun,
   bun2nix,
+  nodejs,
+  git,
   omp,
   source,
   sjujperpowersSource,
@@ -11,6 +13,8 @@
   testFiles,
   pname,
   runBaseline ? false,
+  runWorkflowTests ? false,
+  kata ? null,
 }:
 
 # Isolated continuation trial. Non-fixed-output so the sandbox has no network
@@ -18,8 +22,11 @@
 # without impure evaluation (`impureEnvVars` only applies to fixed-output
 # drvs); parent creates the fixed paths outside the sandbox and proves them
 # there. Do not add extra-sandbox-paths for the sentinel.
-assert lib.assertMsg stdenv.hostPlatform.isLinux "OMP continuation checks require Linux; got ${stdenv.hostPlatform.system}";
-assert lib.assertMsg (testFiles != [ ]) "continuation check needs real test files, not an empty list";
+assert lib.assertMsg stdenv.hostPlatform.isLinux
+  "OMP continuation checks require Linux; got ${stdenv.hostPlatform.system}";
+assert lib.assertMsg (
+  testFiles != [ ]
+) "continuation check needs real test files, not an empty list";
 
 let
   inherit (stdenv) hostPlatform;
@@ -30,6 +37,8 @@ let
   baselineRel = "packages/coding-agent/test/fixtures/continuation/baseline.ts";
   versions = builtins.toJSON {
     system = hostPlatform.system;
+    source = toString source;
+    workflowSource = toString sjujperpowersSource;
     cpu.arch = hostPlatform.parsed.cpu.name;
     sourceRev = sourceRev;
     sjujperpowersRev = sjujperpowersRev;
@@ -48,7 +57,10 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     bun
     bun2nix.hook
-  ];
+    nodejs
+    git
+  ]
+  ++ lib.optional (kata != null) kata;
 
   bunDeps = omp.bunDeps;
   bunInstallFlags = [
@@ -74,6 +86,9 @@ stdenv.mkDerivation {
     CONTINUATION_NATIVE_ADDON = nativeAddon;
     CONTINUATION_BUN_VERSION = bun.version;
     CONTINUATION_NATIVE_ADDON_PATH = "${omp}/lib/pi-natives/${nativeAddon}";
+  }
+  // lib.optionalAttrs (kata != null) {
+    CONTINUATION_KATA_BIN = "${kata}/bin/kata";
   };
 
   buildPhase = ''
@@ -94,6 +109,8 @@ stdenv.mkDerivation {
     export XDG_RUNTIME_DIR="$scratch/xdg-runtime"
     export PI_CONFIG_DIR="$scratch/omp-config"
     export PI_CODING_AGENT_DIR="$scratch/omp-agent"
+    export CONTINUATION_EVIDENCE_DIR="$scratch/continuation-evidence"
+    mkdir -p "$CONTINUATION_EVIDENCE_DIR"
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
       "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$PI_CONFIG_DIR" "$PI_CODING_AGENT_DIR" \
       "$XDG_DATA_HOME/omp" "$XDG_STATE_HOME/omp" "$XDG_CACHE_HOME/omp"
@@ -111,9 +128,17 @@ stdenv.mkDerivation {
 
     # Probe before any OMP import. bun install (hook) does not import OMP.
     bun -- ${lib.escapeShellArg probeRel}
+    test ! -e .continuation-workflow
+    cp -R "$CONTINUATION_SJUJPERPOWERS_SOURCE" .continuation-workflow
     bun run gen:tool-views
 
-    bun test -- ${lib.concatMapStringsSep " " lib.escapeShellArg testFiles}
+    timeout --signal=TERM --kill-after=5s 180s bun test -- ${
+      lib.concatMapStringsSep " " lib.escapeShellArg testFiles
+    }
+
+    ${lib.optionalString runWorkflowTests ''
+      node --test .continuation-workflow/tests/tracking-providers/test-recovery.mjs
+    ''}
 
     ${lib.optionalString runBaseline ''
       if [ ! -f ${lib.escapeShellArg baselineRel} ]; then
@@ -138,6 +163,9 @@ stdenv.mkDerivation {
     ${lib.optionalString runBaseline ''
       cp "$NIX_BUILD_TOP/baseline.json" "$out/baseline.json"
     ''}
+      if [ -d "$CONTINUATION_EVIDENCE_DIR" ]; then
+        cp -R "$CONTINUATION_EVIDENCE_DIR" "$out/evidence"
+      fi
     runHook postInstall
   '';
 

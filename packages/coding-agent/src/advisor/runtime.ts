@@ -542,14 +542,16 @@ export class AdvisorRuntime {
 	}
 
 	/** Stop new advisor work and wait only for the active prompt's recorder-visible events. */
-	pauseForSessionTransition(): Promise<void> {
+	pauseForSessionTransition(options?: { abortActive?: boolean }): Promise<void> {
 		if (!this.#sessionTransitionPaused) {
 			this.#sessionTransitionPaused = true;
 			this.#wakeAllWaiters();
-			this.#iterationAbort?.abort("advisor session transition");
-			try {
-				this.agent.abort("advisor session transition");
-			} catch {}
+			if (options?.abortActive !== false) {
+				this.#iterationAbort?.abort("advisor session transition");
+				try {
+					this.agent.abort("advisor session transition");
+				} catch {}
+			}
 		}
 		return (
 			this.#promptInFlight?.then(

@@ -213,7 +213,7 @@ export async function runEvalWait(
 				.filter(handle => "job" in handle && handle.job.status !== "running")
 				.map(handle => handle.ref.id);
 			const manager = options.session.asyncJobManager;
-			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			if (manager && settledAgentIds.length > 0) await manager.consumeJobResults(settledAgentIds);
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,

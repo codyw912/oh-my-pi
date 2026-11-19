@@ -1,12 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	DeveloperMessage,
 	ImageContent,
 	Message,
 	MessageAttribution,
 	ServiceTierByFamily,
 	TextContent,
 	Usage,
+	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import {
 	directoryIsEnterable,
@@ -18,6 +20,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import { serviceTierForAllFamilies } from "../config/service-tier";
 import type { StructuredSubagentSchemaMode } from "../task/types";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
@@ -36,6 +39,8 @@ import { type BuildSessionContextOptions, buildSessionContext, type SessionConte
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	CONTINUATION_BRIEFING_CUSTOM_TYPE,
+	CONTINUATION_PROTECTED_CONTEXT_TYPE,
 	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -83,6 +88,24 @@ import {
 	type SessionStorage,
 	type SessionStorageWriter,
 } from "./session-storage";
+import {
+	parseContinuationServices,
+	parseContinuationCompletionRouting,
+	buildContinuationCompletionRouting,
+	type ContinuationStagedSession,
+	type ContinuationStageSessionRequest,
+	type ContinuationServiceHandle,
+	type ContinuationCompletionRouting,
+} from "./continuation-handoff";
+import { launchCompletionDetailsContainDaemon } from "./launch-completion";
+import {
+	type ContinuationEvidenceRetention,
+	ContinuationStoreError,
+	createNodeEvidenceIo,
+	type FileEvidenceRef,
+	type RetainContinuationEvidenceRequest,
+	sha256Bytes,
+} from "./continuation-store";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
 	additionalWorkspaceDirectories,
@@ -94,6 +117,73 @@ import { recordSessionTitle } from "./title-index";
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+const CONTINUATION_MEMBERSHIP_CUSTOM_TYPE = "omp-continuation";
+const CONTINUATION_ROLE_OBLIGATIONS_CUSTOM_TYPE = "omp-continuation-role-obligations";
+const CONTINUATION_SERVICES_CUSTOM_TYPE = "omp-continuation-services";
+const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
+const DEFAULT_CONTINUATION_TODO_PHASE = "Tasks";
+
+interface ContinuationTodoTask {
+	content: string;
+	status: string;
+}
+
+function requireContinuationString(value: string, label: string): string {
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new Error(`Continuation staging requires ${label}`);
+	}
+	return value;
+}
+
+function flattenTodoPhaseTasks(phases: unknown[]): ContinuationTodoTask[] {
+	const tasks: ContinuationTodoTask[] = [];
+	for (const phase of phases) {
+		if (!phase || typeof phase !== "object" || !("tasks" in phase) || !Array.isArray(phase.tasks)) continue;
+		for (const task of phase.tasks) {
+			if (!task || typeof task !== "object" || !("content" in task) || !("status" in task)) continue;
+			if (typeof task.content === "string" && typeof task.status === "string") {
+				tasks.push({ content: task.content, status: task.status });
+			}
+		}
+	}
+	return tasks;
+}
+
+function acknowledgedTodoTasks(entries: readonly SessionEntry[]): ContinuationTodoTask[] {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
+			const data = entry.data;
+			if (data && typeof data === "object" && "phases" in data && Array.isArray(data.phases)) {
+				return flattenTodoPhaseTasks(data.phases);
+			}
+			continue;
+		}
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role !== "toolResult" || message.toolName !== "todo" || message.isError) continue;
+		const details = message.details;
+		if (!details || typeof details !== "object" || !("phases" in details) || !Array.isArray(details.phases)) continue;
+		return flattenTodoPhaseTasks(details.phases);
+	}
+	return [];
+}
+
+function sameTodoTasks(left: readonly ContinuationTodoTask[], right: readonly ContinuationTodoTask[]): boolean {
+	if (left.length !== right.length) return false;
+	const a = left.map(task => `${task.status}\0${task.content}`).sort();
+	const b = right.map(task => `${task.status}\0${task.content}`).sort();
+	return a.every((key, index) => key === b[index]);
+}
+
+function portableQueuedInput(message: UserMessage | DeveloperMessage): UserMessage | DeveloperMessage {
+	const role = message.role;
+	if (role !== "user" && role !== "developer") {
+		throw new Error(`Continuation staging rejects queued ${role} inputs`);
+	}
+	const { providerPayload: _providerPayload, ...portable } = message;
+	return portable;
+}
 
 function mintSessionId(): string {
 	return Bun.randomUUIDv7();
@@ -552,6 +642,12 @@ export class SessionManager {
 	#sessionFileRelocating: { source: string; dest: string } | null = null;
 	/** Atomic entry batch currently staged for a full-file commit. */
 	#atomicEntryBatch: AtomicEntryBatch | undefined;
+	/**
+	 * Bumped when the live transcript prefix changes (title slot rewrite or
+	 * full-body rewrite). Append-only growth keeps the same generation so
+	 * continuation evidence can copy only new bytes.
+	 */
+	#continuationEvidenceGeneration = 1;
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
@@ -792,6 +888,7 @@ export class SessionManager {
 			this.#fileIsCurrent = true;
 			this.#rewriteRequired = false;
 			this.#hasTitleSlot = true;
+			this.#continuationEvidenceGeneration++;
 			this.#clearDiskError();
 		} catch (error) {
 			if (error instanceof SessionPersistenceIndeterminateError) throw error;
@@ -876,6 +973,7 @@ export class SessionManager {
 			this.#diskTail = Promise.resolve();
 			this.#closeWriterEventually();
 			this.#storage.writeTextSync(targetPath, body);
+			this.#continuationEvidenceGeneration++;
 			this.#clearDiskError();
 			// Only mark the manager current when writing the active session path.
 			// Mid-move writes update the live relocation path; `#sessionFile` is
@@ -949,6 +1047,7 @@ export class SessionManager {
 				});
 				if (this.#diskEpoch !== epoch) return false;
 			} while (this.#atomicRewriteDirty);
+			this.#continuationEvidenceGeneration++;
 			return true;
 		} finally {
 			// Only relinquish the fence if we still own it. A superseding
@@ -1081,6 +1180,7 @@ export class SessionManager {
 				try {
 					await this.#appendWriter().append(line);
 					await this.#storage.updateSessionTitle(sessionFile, update);
+					this.#continuationEvidenceGeneration++;
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -1716,6 +1816,200 @@ export class SessionManager {
 	}
 
 	/**
+	 * Create an independent staged continuation session beside this manager.
+	 * Never switches or mutates the source transcript; does not open AgentSession.
+	 */
+	async stageContinuation(request: ContinuationStageSessionRequest): Promise<ContinuationStagedSession> {
+		const durability = this.#storage.continuationDurability();
+		if (
+			!this.#persist ||
+			durability.kind !== "file-backed-os-sync" ||
+			!(this.#storage instanceof FileSessionStorage)
+		) {
+			const reason =
+				durability.kind === "unsupported"
+					? `${durability.backend} storage reports: ${durability.reason}`
+					: "session manager is not persistently file-backed";
+			throw new ContinuationStoreError(
+				"unsupported-storage",
+				`Continuation staging requires file-backed OS sync; ${reason}`,
+				durability.kind === "unsupported" ? { backend: durability.backend } : undefined,
+			);
+		}
+		const storage = this.#storage;
+		const planPath = requireContinuationString(request.planPath, "planPath");
+		const runId = requireContinuationString(request.runId, "runId");
+		const evidencePath = requireContinuationString(request.evidencePath, "evidencePath");
+		requireContinuationString(request.sourceSessionId, "sourceSessionId");
+		if (request.sourceSessionId !== this.#sessionId) {
+			throw new Error(
+				`Continuation stage source session ${request.sourceSessionId} does not match ${this.#sessionId}`,
+			);
+		}
+		if (!request.briefing || typeof request.briefing.text !== "string") {
+			throw new Error("Continuation staging requires a portable briefing.");
+		}
+		if (!Array.isArray(request.services)) {
+			throw new Error("Continuation staging requires portable service handles");
+		}
+		const services = parseContinuationServices({ version: 1, services: request.services });
+		for (const message of request.queuedMessages) {
+			const role = message.role;
+			if (role !== "user" && role !== "developer") {
+				throw new Error(`Continuation staging rejects queued ${role} inputs`);
+			}
+		}
+		const sourceTodos = acknowledgedTodoTasks(this.getBranch());
+		const canonicalTodos = (request.todos ?? []).map(todo => ({ content: todo.content, status: todo.status }));
+		if (sourceTodos.length > 0 && !sameTodoTasks(sourceTodos, canonicalTodos)) {
+			throw new Error("Source session todos contradict the canonical continuation projection.");
+		}
+
+		const retainedExisted = storage.existsSync(evidencePath);
+		let dest: SessionManager | undefined;
+		let destFile: string | undefined;
+		let committed = false;
+		try {
+			const staged = new SessionManager(this.#cwd, this.#sessionDir, true, storage);
+			dest = staged;
+			staged.#suppressBreadcrumb = true;
+			staged.#resetToNewSession();
+			destFile = staged.getSessionFile();
+			await staged.appendEntriesAtomically(() => {
+				staged.appendCustomEntry(CONTINUATION_MEMBERSHIP_CUSTOM_TYPE, {
+					version: 1,
+					runId,
+					planPath,
+				});
+				staged.appendModelChange(`${request.destination.provider}/${request.destination.model}`);
+				if (request.destination.settings.thinkingLevel !== undefined) {
+					staged.appendThinkingLevelChange(request.destination.settings.thinkingLevel);
+				}
+				if (request.destination.settings.serviceTier !== undefined) {
+					const tiers = serviceTierForAllFamilies(request.destination.settings.serviceTier);
+					staged.appendServiceTierChange(Object.keys(tiers).length > 0 ? tiers : null);
+				}
+				if (canonicalTodos.length > 0) {
+					staged.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
+						phases: [
+							{
+								name: DEFAULT_CONTINUATION_TODO_PHASE,
+								tasks: canonicalTodos.map(todo => ({
+									content: todo.content,
+									status: todo.status,
+								})),
+							},
+						],
+					});
+				}
+				if (request.roleObligations.length > 0) {
+					staged.appendCustomEntry(CONTINUATION_ROLE_OBLIGATIONS_CUSTOM_TYPE, {
+						roleObligations: [...request.roleObligations],
+					});
+				}
+				staged.appendCustomEntry(CONTINUATION_SERVICES_CUSTOM_TYPE, {
+					version: 1,
+					services,
+					completionRouting: buildContinuationCompletionRouting(
+						request.sourceSessionId,
+						staged.getSessionId(),
+						services,
+						this.getContinuationCompletionRouting(),
+					),
+				});
+				const protectedEntryIds = [
+					staged.appendCustomMessageEntry(CONTINUATION_BRIEFING_CUSTOM_TYPE, request.briefing.text, true),
+				];
+				for (const message of request.queuedMessages) {
+					protectedEntryIds.push(staged.appendMessage(portableQueuedInput(message)));
+				}
+				staged.appendCustomEntry(CONTINUATION_PROTECTED_CONTEXT_TYPE, {
+					version: 1,
+					entryIds: protectedEntryIds,
+				});
+			});
+			if (request.draft !== null && request.draft.length > 0) {
+				await staged.saveDraft(request.draft);
+				const draftPath = staged.#draftPath();
+				if (!draftPath) throw new Error("Staged draft has no durable path");
+				const io = createNodeEvidenceIo();
+				io.fsyncFile(draftPath);
+				io.fsyncDir(path.dirname(draftPath));
+			}
+			await staged.flush();
+			const sessionFile = staged.getSessionFile();
+			if (!sessionFile || !storage.existsSync(sessionFile)) {
+				throw new ContinuationStoreError(
+					"missing-session-file",
+					"Staged continuation session file was not materialized.",
+				);
+			}
+			if (path.resolve(evidencePath) === path.resolve(sessionFile)) {
+				throw new ContinuationStoreError(
+					"overwrite-retained-evidence",
+					"Retained transcript destination must be independent of the staged session file",
+				);
+			}
+			const retained = await staged.retainContinuationEvidence({ destinationPath: evidencePath });
+			const size = storage.statSync(sessionFile).size;
+			const liveBytes = storage.readFileRange(sessionFile, 0, size);
+			const sha256 = sha256Bytes(liveBytes);
+			if (retained.evidence.byteLength !== size || retained.evidence.sha256 !== sha256) {
+				throw new ContinuationStoreError(
+					"publication-failed",
+					"Retained staged transcript is not the exact complete session file",
+				);
+			}
+			const transcript: FileEvidenceRef = {
+				kind: "file",
+				path: createNodeEvidenceIo().realpath(sessionFile),
+				byteLength: size,
+				sha256,
+			};
+			const sessionId = staged.getSessionId();
+			await staged.close();
+			committed = true;
+			return {
+				sessionId,
+				sessionFile: transcript.path,
+				transcript,
+				retainedTranscript: retained.evidence,
+			};
+		} catch (error) {
+			if (!committed && dest) {
+				try {
+					if (destFile) await dest.dropSession(destFile);
+				} catch (cleanupError) {
+					if (!isEnoent(cleanupError)) {
+						logger.warn("Failed to drop unusable staged continuation session", {
+							sessionFile: destFile,
+							error: toError(cleanupError).message,
+						});
+					}
+				}
+				try {
+					await dest.close();
+				} catch {
+					// Dest is already unusable; the original error is authoritative.
+				}
+				if (!retainedExisted && storage.existsSync(evidencePath)) {
+					try {
+						await storage.unlink(evidencePath);
+					} catch (cleanupError) {
+						if (!isEnoent(cleanupError)) {
+							logger.warn("Failed to remove partial staged continuation evidence", {
+								evidencePath,
+								error: toError(cleanupError).message,
+							});
+						}
+					}
+				}
+			}
+			throw error;
+		}
+	}
+
+	/**
 	 * Stage a synchronous group of entry appends and publish the resulting full
 	 * journal with one atomic replace. A failed publish removes only the staged
 	 * entries, preserves/reparents entries appended concurrently, restores the
@@ -1812,6 +2106,167 @@ export class SessionManager {
 		// flush() see the write durably visible to readers.
 		await this.#storage.drain();
 		if (this.#diskFailure) throw this.#diskFailure;
+	}
+
+	getContinuationEvidenceGeneration(): number {
+		return this.#continuationEvidenceGeneration;
+	}
+
+	/**
+	 * Serialized recovery barrier for referenced transcript evidence. Copies a
+	 * bounded prefix into an immutable destination; it does not hard-link the
+	 * live transcript (titles rewrite the first slot in place) and does not
+	 * treat {@link flush} as fsync.
+	 */
+	retainContinuationEvidence(request: RetainContinuationEvidenceRequest): Promise<ContinuationEvidenceRetention> {
+		return this.#withAtomicPersistenceLock(async () => {
+			const result: { value?: ContinuationEvidenceRetention; failed?: true; error?: unknown } = {};
+			await this.#scheduleDiskWork(
+				async () => {
+					if (this.#writer?.isOpen()) await this.#writer.flush();
+					try {
+						result.value = await this.#retainContinuationEvidenceLocked(request);
+					} catch (error) {
+						// A rejected evidence destination/capability is not a corrupt live transcript.
+						result.failed = true;
+						result.error = error;
+					}
+				},
+				{ ignoreEpoch: true },
+			);
+			if (result.failed) throw result.error;
+			if (!result.value)
+				throw new ContinuationStoreError("publication-failed", "Transcript evidence barrier did not execute");
+			return result.value;
+		});
+	}
+
+	async #retainContinuationEvidenceLocked(
+		request: RetainContinuationEvidenceRequest,
+	): Promise<ContinuationEvidenceRetention> {
+		const durability = this.#storage.continuationDurability();
+		if (durability.kind === "unsupported") {
+			throw new ContinuationStoreError(
+				"unsupported-storage",
+				`Continuation evidence barrier requires file-backed OS sync; ${durability.backend} storage reports: ${durability.reason}`,
+				{ backend: durability.backend },
+			);
+		}
+		if (!(this.#storage instanceof FileSessionStorage)) {
+			throw new ContinuationStoreError(
+				"unsupported-storage",
+				"Continuation evidence barrier requires FileSessionStorage for OS-synchronized prefix copies.",
+			);
+		}
+		if (this.#released) {
+			throw new ContinuationStoreError("missing-session-file", "Session manager has released its transcript.");
+		}
+		if (this.#diskFailure) throw this.#diskFailure;
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile || !this.#storage.existsSync(sessionFile)) {
+			throw new ContinuationStoreError(
+				"missing-session-file",
+				"Cannot retain continuation evidence before the session file exists.",
+			);
+		}
+		this.#storage.syncFile(sessionFile);
+		const size = this.#storage.statSync(sessionFile).size;
+		const byteLength = request.byteLength ?? size;
+		if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > size) {
+			throw new ContinuationStoreError(
+				"prefix-out-of-range",
+				`Requested prefix ${byteLength} is not a valid boundary within session file size ${size}`,
+				{ byteLength, size },
+			);
+		}
+		const io = request.io ?? createNodeEvidenceIo();
+		const generation = this.#continuationEvidenceGeneration;
+		const previous = request.previous;
+		if (previous && previous.path === request.destinationPath && previous.generation !== generation) {
+			throw new ContinuationStoreError(
+				"overwrite-retained-evidence",
+				"Refusing to overwrite retained evidence after a prefix-changing rewrite; pass a new destinationPath.",
+				{ previous, generation },
+			);
+		}
+		if (!previous && io.exists(request.destinationPath)) {
+			throw new ContinuationStoreError(
+				"overwrite-retained-evidence",
+				`Refusing to overwrite existing retained evidence at ${request.destinationPath}`,
+			);
+		}
+		const evidenceDir = path.dirname(path.resolve(request.destinationPath));
+		let existingAncestor = evidenceDir;
+		while (!io.exists(existingAncestor)) {
+			const parent = path.dirname(existingAncestor);
+			if (parent === existingAncestor)
+				throw new ContinuationStoreError("publication-failed", "No existing evidence ancestor");
+			existingAncestor = parent;
+		}
+		if (
+			io.realpath(existingAncestor) !== existingAncestor ||
+			(io.exists(request.destinationPath) &&
+				io.realpath(request.destinationPath) !== path.resolve(request.destinationPath))
+		) {
+			throw new ContinuationStoreError(
+				"symlink-ambiguous",
+				"Retained evidence must use canonical, non-symlink paths",
+			);
+		}
+		io.mkdirp(evidenceDir);
+		if (io.realpath(evidenceDir) !== evidenceDir) {
+			throw new ContinuationStoreError(
+				"symlink-ambiguous",
+				"Retained evidence directory changed during publication",
+			);
+		}
+		let bytesCopied = 0;
+		const canExtend =
+			previous !== undefined &&
+			previous.generation === generation &&
+			previous.path === request.destinationPath &&
+			previous.byteLength <= byteLength &&
+			io.exists(request.destinationPath);
+		if (canExtend && previous) {
+			const livePrefix = this.#storage.readFileRange(sessionFile, 0, previous.byteLength);
+			const retainedPrefix = io.readRange(request.destinationPath, 0, previous.byteLength);
+			const liveHash = sha256Bytes(livePrefix);
+			const retainedHash = sha256Bytes(retainedPrefix);
+			if (liveHash !== previous.sha256 || retainedHash !== previous.sha256) {
+				throw new ContinuationStoreError(
+					"overwrite-retained-evidence",
+					"Live or retained prefix no longer matches the acknowledged cursor; pass a new destinationPath.",
+					{ liveHash, retainedHash, expected: previous.sha256 },
+				);
+			}
+			const delta = byteLength - previous.byteLength;
+			if (delta > 0) {
+				const extra = this.#storage.readFileRange(sessionFile, previous.byteLength, delta);
+				io.appendFile(request.destinationPath, extra);
+				bytesCopied = extra.byteLength;
+			}
+		} else {
+			const prefix = this.#storage.readFileRange(sessionFile, 0, byteLength);
+			io.writeFile(request.destinationPath, prefix);
+			bytesCopied = prefix.byteLength;
+		}
+		io.fsyncFile(request.destinationPath);
+		for (let dir = evidenceDir; ; dir = path.dirname(dir)) {
+			io.fsyncDir(dir);
+			if (dir === existingAncestor) break;
+		}
+		const hashed = io.readRange(request.destinationPath, 0, byteLength);
+		const evidence: FileEvidenceRef = {
+			kind: "file",
+			path: io.realpath(request.destinationPath),
+			byteLength,
+			sha256: sha256Bytes(hashed),
+		};
+		return {
+			evidence,
+			cursor: { generation, byteLength },
+			metrics: { bytesCopied, bytesHashed: byteLength + (canExtend && previous ? 2 * previous.byteLength : 0) },
+		};
 	}
 
 	/**
@@ -1927,6 +2382,32 @@ export class SessionManager {
 
 	getCwd(): string {
 		return this.#cwd;
+	}
+
+	/** Structured hub service handles retained on a staged continuation session. */
+	getContinuationServices(): ContinuationServiceHandle[] {
+		const entry = this.getBranch().findLast(
+			item => item.type === "custom" && item.customType === CONTINUATION_SERVICES_CUSTOM_TYPE,
+		);
+		if (!entry || entry.type !== "custom") return [];
+		return parseContinuationServices(entry.data);
+	}
+
+	/** Durable completion-owner routes retained with staged continuation services. */
+	getContinuationCompletionRouting(): ContinuationCompletionRouting | undefined {
+		const entry = this.getBranch().findLast(
+			item => item.type === "custom" && item.customType === CONTINUATION_SERVICES_CUSTOM_TYPE,
+		);
+		if (!entry || entry.type !== "custom") return undefined;
+		return parseContinuationCompletionRouting(entry.data);
+	}
+
+	/** True when this session already recorded a launch completion for the process generation. */
+	hasLaunchCompletionReceipt(daemon: { id: string; startedAt: number }): boolean {
+		return this.getBranch().some(item => {
+			if (item.type !== "custom_message" || item.customType !== "launch-completion") return false;
+			return launchCompletionDetailsContainDaemon(item.details, daemon);
+		});
 	}
 
 	/** Recorded cwd from the session header (original project), may differ from runtime {@link getCwd} when fallback retained launch cwd. */

@@ -2,9 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in same-host work continuation with durable admission and ownership, focused fresh-session briefings, and policy-approved cross-provider handoff. Recovery preserves pending work, review obligations, instructions, and service-completion receipts.
+- Added provider-free continuity and transfer-cost reporting. Economic selection remains conservative without measured evidence; no production savings thresholds or automatic economic rotation are enabled.
+
 ### Fixed
 
 - Fixed Codex Astra retaining its larger window after disabling Extended Context, including cached models; explicit model overrides still take precedence.
+- Preserved carried continuation instructions and results across local and provider-managed compaction.
+- Made broker completion publication, routing, and acknowledgment durable and serialized, including storage-failure recovery and generation-specific replay.
+- Exposed the existing per-prompt terminal-empty-stop option to typed SDK callers, allowing bounded evaluations to avoid recovery requests without changing normal session defaults.
+- Listed the bounded continuation pilot's public workspace paths in its source primer, making files discoverable without preloading their contents into the comparison transcript.
+- Removed the continuation pilot's artificial request-count cutoffs while retaining its cumulative spending limit, timeout, and no-retry behavior.
 
 ## [18.1.12] - 2026-09-06
 

@@ -4,6 +4,7 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as path from "node:path";
 
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { type Api, type AssistantMessage, completeSimple, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
 import { isConPTYHosted, writeThroughActiveTerminal } from "@oh-my-pi/pi-tui";
@@ -17,6 +18,7 @@ import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "
 import { formatTitleUserMessage } from "../tiny/message-preproc";
 import { isTinyTitleLocalModelKey, ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
 import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
+import { rejectEnrolledUnsupportedInference } from "../session/continuation-complete";
 import { tinyTitleClient } from "../tiny/title-client";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt, { includeExamples: true });
@@ -149,6 +151,7 @@ export async function generateSessionTitle(
 	customSystemPrompt?: string,
 	signal?: AbortSignal,
 	credentialSourceSessionId?: string,
+	streamFn?: StreamFn,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -172,6 +175,7 @@ export async function generateSessionTitle(
 			signal,
 			titleSystemPrompt,
 			credentialSourceSessionId,
+			streamFn,
 		);
 	}
 
@@ -189,6 +193,10 @@ export async function generateSessionTitle(
 		});
 		return null;
 	}
+	rejectEnrolledUnsupportedInference(
+		streamFn !== undefined,
+		"Continuation HTTP admission is unsupported for local tiny title inference",
+	);
 	try {
 		let localTitle: string | null;
 		if (signal) {
@@ -231,6 +239,7 @@ export async function generateTitleOnline(
 	signal?: AbortSignal,
 	customSystemPrompt?: string,
 	credentialSourceSessionId?: string,
+	streamFn?: StreamFn,
 ): Promise<string | null> {
 	const model = getTitleModel(registry, settings, currentModel);
 	if (!model) {
@@ -279,9 +288,19 @@ export async function generateTitleOnline(
 		const maxTokens = TITLE_MAX_TOKENS;
 		logger.debug("title-generator: request", { ...modelContext, maxTokens });
 
+		const complete = streamFn
+			? async (
+					requestModel: Model<Api>,
+					context: Parameters<typeof completeSimple>[1],
+					options?: Parameters<typeof completeSimple>[2],
+				) => {
+					const stream = await streamFn(requestModel, context, options);
+					return stream.result();
+				}
+			: completeSimple;
 		const response = await retryTransientCompletion(
 			() =>
-				completeSimple(
+				complete(
 					model,
 					{
 						systemPrompt,
@@ -292,10 +311,6 @@ export async function generateTitleOnline(
 						sessionId,
 						maxTokens,
 						disableReasoning: true,
-						// Greedy decode: titling is extraction, not generation. Backends that
-						// default temperature high (e.g. Ollama's 0.8) otherwise garble names
-						// from the message ("hashline" → "HasHroshi"). Providers whose models
-						// reject sampling params drop this via `supportsSamplingParams`.
 						temperature: 0,
 						metadata,
 						signal,

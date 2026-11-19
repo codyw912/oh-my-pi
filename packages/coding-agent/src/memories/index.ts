@@ -17,6 +17,7 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -407,6 +408,10 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
 				metadata: session.agent?.metadataForProvider(phase1Model.provider),
+				completeImpl: completeImplFromEnrollment(
+					session.inferenceStreamFn,
+					session.continuationFactory !== undefined,
+				),
 			});
 			if (!isMemoryStartupActive(options)) return;
 
@@ -568,6 +573,10 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
 				sessionId: session.sessionId,
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
+				completeImpl: completeImplFromEnrollment(
+					session.inferenceStreamFn,
+					session.continuationFactory !== undefined,
+				),
 			});
 			if (!isMemoryStartupActive(options)) return;
 			await applyConsolidation(memoryRoot, consolidated);
@@ -729,6 +738,7 @@ async function runStage1Job(options: {
 	modelMaxTokens: number;
 	config: MemoryRuntimeConfig;
 	metadata?: Record<string, unknown>;
+	completeImpl?: typeof completeSimple;
 }): Promise<
 	| {
 			kind: "output";
@@ -753,8 +763,9 @@ async function runStage1Job(options: {
 			response_items_json: truncatedItems,
 		});
 
+		const complete = options.completeImpl ?? completeSimple;
 		const response = await retryTransientCompletion(() =>
-			completeSimple(
+			complete(
 				model,
 				{
 					systemPrompt: [stageOneSystemTemplate],
@@ -875,6 +886,7 @@ async function runConsolidationModel(options: {
 	apiKey: ApiKey;
 	sessionId: string;
 	metadata?: Record<string, unknown>;
+	completeImpl?: typeof completeSimple;
 }): Promise<{
 	memoryMd: string;
 	memorySummary: string;
@@ -894,8 +906,9 @@ async function runConsolidationModel(options: {
 		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
 	});
 
+	const complete = options.completeImpl ?? completeSimple;
 	const response = await retryTransientCompletion(() =>
-		completeSimple(
+		complete(
 			model,
 			{
 				systemPrompt: [consolidationSystemTemplate],

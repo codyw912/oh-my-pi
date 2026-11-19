@@ -89,6 +89,8 @@ interface ManagedDaemon {
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
 	completionSubscriptionId?: string;
+	/** Successor owner for completion delivery; daemon.owner stays the predecessor. */
+	completionRoute?: string;
 	persistQueue: Promise<void>;
 }
 
@@ -109,6 +111,38 @@ function quoteShellArg(value: string): string {
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
 	return state === "exited" || state === "failed";
+}
+
+function sameDaemonGeneration(
+	daemon: Pick<DaemonSnapshot, "id" | "startedAt">,
+	id: string,
+	startedAt: number,
+): boolean {
+	return daemon.id === id && daemon.startedAt === startedAt;
+}
+
+async function syncPath(target: string): Promise<void> {
+	const handle = await fs.open(target, "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+function cloneCompletionMap(
+	source: Map<string, DaemonCompletionNotification> | undefined,
+): Map<string, DaemonCompletionNotification> | undefined {
+	return source === undefined ? undefined : new Map(source);
+}
+
+function restoreCompletionMap(
+	maps: Map<string, Map<string, DaemonCompletionNotification>>,
+	owner: string,
+	previous: Map<string, DaemonCompletionNotification> | undefined,
+): void {
+	if (previous && previous.size > 0) maps.set(owner, previous);
+	else maps.delete(owner);
 }
 
 function settledState(state: DaemonSnapshot["state"]): boolean {
@@ -373,6 +407,7 @@ class DaemonBroker {
 	#server: net.Server | undefined;
 	#idleTimer: NodeJS.Timeout | undefined;
 	#shuttingDown = false;
+	#completionMutations: Promise<void> = Promise.resolve();
 
 	constructor(
 		projectDir: string,
@@ -414,6 +449,7 @@ class DaemonBroker {
 			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
 			clearTimeout(record.restartTimer);
 			await record.log?.close();
+			await this.#completionMutations;
 			await record.persistQueue;
 		}
 		this.#ownerSockets.clear();
@@ -469,6 +505,15 @@ class DaemonBroker {
 		});
 	}
 
+	#withCompletionMutation<T>(work: () => Promise<T>): Promise<T> {
+		const result = this.#completionMutations.then(work, work);
+		this.#completionMutations = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
 	async #handleLine(socket: net.Socket, line: string, onAuthenticated: () => void): Promise<void> {
 		let id = "unknown";
 		try {
@@ -477,78 +522,88 @@ class DaemonBroker {
 			id = request.id;
 			if (request.token !== this.#token) throw new Error("Daemon broker authentication failed");
 			onAuthenticated();
-			for (const owner of request.completionUnsubscribes ?? []) {
-				const subscriptionId = this.#completionSubscriptions.get(owner);
-				if (
-					!this.#completionSubscriptions.has(owner) ||
-					(subscriptionId !== undefined && subscriptionId !== request.completionSubscriptionId)
-				) {
-					continue;
-				}
-				this.#ownerSockets.delete(owner);
-				this.#completionSubscriptions.delete(owner);
-				await this.#setRecordCompletionCapability(owner, false);
-				this.#pendingCompletions.delete(owner);
-			}
-			for (const completionId of request.completionAcks ?? []) {
-				for (const [owner, pending] of this.#pendingCompletions) {
-					const registration = this.#ownerSockets.get(owner);
+			await this.#withCompletionMutation(async () => {
+				for (const owner of request.completionUnsubscribes ?? []) {
+					const subscriptionId = this.#completionSubscriptions.get(owner);
 					if (
-						!registration ||
-						registration.socket !== socket ||
-						registration.subscriptionId !== request.completionSubscriptionId
+						!this.#completionSubscriptions.has(owner) ||
+						(subscriptionId !== undefined && subscriptionId !== request.completionSubscriptionId)
 					) {
 						continue;
 					}
-					const completion = pending.get(completionId);
-					if (!completion) continue;
-					pending.delete(completionId);
-					if (pending.size === 0) this.#pendingCompletions.delete(owner);
-					const record = this.#records.get(completion.daemon.name);
-					const index = record?.pendingCompletions.findIndex(item => item.completionId === completionId) ?? -1;
-					if (record && index >= 0) {
-						record.pendingCompletions.splice(index, 1);
-						this.#persist(record);
-						await record.persistQueue;
-					}
-				}
-			}
-			if (publishesCompletionOwners(request)) {
-				const replayOwners = new Set(request.completionReplays ?? []);
-				const activeOwners = new Set(request.owners ?? []);
-				const detachedOwners = new Set(request.detachedOwners ?? []);
-				const advertisedOwners = new Set([...activeOwners, ...detachedOwners]);
-				for (const [owner, subscriptionId] of this.#completionSubscriptions) {
-					if (subscriptionId !== request.completionSubscriptionId || advertisedOwners.has(owner)) continue;
 					this.#ownerSockets.delete(owner);
 					this.#completionSubscriptions.delete(owner);
-					await this.#setRecordCompletionCapability(owner, false);
+					await this.#setRecordCompletionCapability(owner);
 					this.#pendingCompletions.delete(owner);
 				}
-				for (const owner of activeOwners) {
-					this.#completionSubscriptions.set(owner, request.completionSubscriptionId);
-					await this.#setRecordCompletionCapability(owner, true);
-					const previous = this.#ownerSockets.get(owner);
-					this.#ownerSockets.set(owner, {
-						socket,
-						subscriptionId: request.completionSubscriptionId,
-					});
-					if (previous?.socket === socket && !replayOwners.has(owner)) continue;
-					for (const completion of this.#pendingCompletions.get(owner)?.values() ?? []) {
-						socket.write(`${JSON.stringify(completion)}\n`);
+				for (const completionId of request.completionAcks ?? []) {
+					for (const [owner, pending] of this.#pendingCompletions) {
+						const registration = this.#ownerSockets.get(owner);
+						if (
+							!registration ||
+							registration.socket !== socket ||
+							registration.subscriptionId !== request.completionSubscriptionId
+						) {
+							continue;
+						}
+						const completion = pending.get(completionId);
+						if (!completion) continue;
+						pending.delete(completionId);
+						if (pending.size === 0) this.#pendingCompletions.delete(owner);
+						const record = this.#records.get(completion.daemon.name);
+						const index = record?.pendingCompletions.findIndex(item => item.completionId === completionId) ?? -1;
+						if (record && index >= 0) {
+							const removed = record.pendingCompletions.splice(index, 1);
+							try {
+								await this.#persistRequired(record);
+							} catch (error) {
+								record.pendingCompletions.splice(index, 0, ...removed);
+								const restored = this.#pendingCompletions.get(owner) ?? new Map();
+								restored.set(completionId, completion);
+								this.#pendingCompletions.set(owner, restored);
+								throw error;
+							}
+						}
 					}
 				}
-				for (const owner of detachedOwners) {
-					const subscriptionId = this.#completionSubscriptions.get(owner);
-					if (this.#completionSubscriptions.has(owner) && subscriptionId !== request.completionSubscriptionId) {
-						continue;
+				if (publishesCompletionOwners(request)) {
+					const replayOwners = new Set(request.completionReplays ?? []);
+					const activeOwners = new Set(request.owners ?? []);
+					const detachedOwners = new Set(request.detachedOwners ?? []);
+					const advertisedOwners = new Set([...activeOwners, ...detachedOwners]);
+					for (const [owner, subscriptionId] of this.#completionSubscriptions) {
+						if (subscriptionId !== request.completionSubscriptionId || advertisedOwners.has(owner)) continue;
+						this.#ownerSockets.delete(owner);
+						this.#completionSubscriptions.delete(owner);
+						await this.#setRecordCompletionCapability(owner);
+						this.#pendingCompletions.delete(owner);
 					}
-					this.#completionSubscriptions.set(owner, request.completionSubscriptionId);
-					await this.#setRecordCompletionCapability(owner, true);
-					const registration = this.#ownerSockets.get(owner);
-					if (registration?.subscriptionId === request.completionSubscriptionId) this.#ownerSockets.delete(owner);
+					for (const owner of activeOwners) {
+						this.#completionSubscriptions.set(owner, request.completionSubscriptionId);
+						await this.#setRecordCompletionCapability(owner);
+						const previous = this.#ownerSockets.get(owner);
+						this.#ownerSockets.set(owner, {
+							socket,
+							subscriptionId: request.completionSubscriptionId,
+						});
+						if (previous?.socket === socket && !replayOwners.has(owner)) continue;
+						for (const completion of this.#pendingCompletions.get(owner)?.values() ?? []) {
+							socket.write(`${JSON.stringify(completion)}\n`);
+						}
+					}
+					for (const owner of detachedOwners) {
+						const subscriptionId = this.#completionSubscriptions.get(owner);
+						if (this.#completionSubscriptions.has(owner) && subscriptionId !== request.completionSubscriptionId) {
+							continue;
+						}
+						this.#completionSubscriptions.set(owner, request.completionSubscriptionId);
+						await this.#setRecordCompletionCapability(owner);
+						const registration = this.#ownerSockets.get(owner);
+						if (registration?.subscriptionId === request.completionSubscriptionId)
+							this.#ownerSockets.delete(owner);
+					}
 				}
-			}
+			});
 			const result = await this.#dispatch(request.operation);
 			socket.write(`${JSON.stringify({ id, ok: true, result })}\n`);
 			if (request.operation.op === "shutdown") setTimeout(() => void this.shutdown(), 10);
@@ -569,6 +624,7 @@ class DaemonBroker {
 				return {
 					op: "list",
 					daemons: orderDaemonsForListing([...this.#records.values()].map(record => record.snapshot)),
+					pendingCompletions: this.#listedPendingCompletions(),
 				};
 			}
 			case "logs":
@@ -589,6 +645,8 @@ class DaemonBroker {
 				await this.#refreshDetached(record);
 				return { op: "describe", daemon: record.snapshot, spec: record.spec };
 			}
+			case "route-completion":
+				return this.#routeCompletion(operation);
 			case "shutdown":
 				return { op: "shutdown" };
 		}
@@ -682,28 +740,33 @@ class DaemonBroker {
 			);
 			readyTimedOut = !ready;
 		}
+		await this.#completionMutations;
 		await record.persistQueue;
 		return { op: "start", daemon: record.snapshot, readyTimedOut };
 	}
 
 	async #launch(record: ManagedDaemon): Promise<void> {
-		record.generation++;
-		const generation = record.generation;
-		record.stopRequested = false;
-		record.snapshot.state = record.spec.ready ? "starting" : "running";
-		record.snapshot.startedAt = Date.now();
-		record.snapshot.readyAt = undefined;
-		record.snapshot.exitedAt = undefined;
-		record.snapshot.exitCode = undefined;
-		record.snapshot.exitReason = undefined;
-		record.snapshot.pid = undefined;
-		record.snapshot.readyMatch = undefined;
-		record.logReady = !record.spec.ready?.log;
-		record.portReady = record.spec.ready?.port === undefined;
-		syncReadyPending(record);
-		record.readinessBuffer = "";
-		record.outputOffset = 0;
-		this.#persist(record);
+		const generation = await this.#withCompletionMutation(async () => {
+			if (record.stopRequested) return undefined;
+			record.generation++;
+			record.stopRequested = false;
+			record.snapshot.state = record.spec.ready ? "starting" : "running";
+			record.snapshot.startedAt = Date.now();
+			record.snapshot.readyAt = undefined;
+			record.snapshot.exitedAt = undefined;
+			record.snapshot.exitCode = undefined;
+			record.snapshot.exitReason = undefined;
+			record.snapshot.pid = undefined;
+			record.snapshot.readyMatch = undefined;
+			record.logReady = !record.spec.ready?.log;
+			record.portReady = record.spec.ready?.port === undefined;
+			syncReadyPending(record);
+			record.readinessBuffer = "";
+			record.outputOffset = 0;
+			await this.#enqueuePersist(record, false);
+			return record.generation;
+		});
+		if (generation === undefined) return;
 		try {
 			if (record.spec.detached) await this.#launchDetached(record, generation);
 			else if (record.spec.pty) await this.#launchPty(record, generation);
@@ -948,6 +1011,15 @@ class DaemonBroker {
 	}
 
 	async #settle(record: ManagedDaemon, generation: number, exitCode?: number, error?: string): Promise<void> {
+		return this.#withCompletionMutation(() => this.#settleCompletion(record, generation, exitCode, error));
+	}
+
+	async #settleCompletion(
+		record: ManagedDaemon,
+		generation: number,
+		exitCode?: number,
+		error?: string,
+	): Promise<void> {
 		// `restarting` is a settled state (child exited, relaunch timer armed). Any op that
 		// runs #refreshDetached on such a record must not re-settle it: re-entry double-counts
 		// restartCount and overwrites record.restartTimer, orphaning the armed timer so it fires
@@ -985,7 +1057,7 @@ class DaemonBroker {
 			record.log?.append(
 				`\n[daemon exited${exitCode === undefined ? "" : ` with code ${exitCode}`}; restarting in ${delay}ms]\n`,
 			);
-			this.#persist(record);
+			await this.#enqueuePersist(record, false);
 			record.restartTimer = setTimeout(() => {
 				record.restartTimer = undefined;
 				void this.#launch(record);
@@ -993,24 +1065,45 @@ class DaemonBroker {
 			return;
 		}
 		record.snapshot.state = failed && !record.stopRequested ? "failed" : "exited";
+		const deliveryOwner = record.completionRoute ?? record.snapshot.owner;
 		const completion =
-			record.snapshot.owner !== undefined &&
+			deliveryOwner !== undefined &&
 			!record.stopRequested &&
-			this.#completionSubscriptions.has(record.snapshot.owner)
+			(this.#completionSubscriptions.has(deliveryOwner) ||
+				(record.snapshot.owner !== undefined && this.#completionSubscriptions.has(record.snapshot.owner)))
 				? ({
 						event: "daemon-completed",
 						completionId: crypto.randomUUID(),
-						owner: record.snapshot.owner,
+						owner: deliveryOwner,
 						daemon: { ...record.snapshot },
 					} satisfies DaemonCompletionNotification)
 				: undefined;
 		if (completion) record.pendingCompletions.push(completion);
-		this.#persist(record);
+		let completionDurable = false;
+		if (completion) {
+			// A transient write fault must not erase the only completion. Retry
+			// once; a persistent fault stays pending and unnotified for recovery.
+			for (let attempt = 0; attempt < 2; attempt++) {
+				try {
+					await this.#persistRequired(record);
+					completionDurable = true;
+					break;
+				} catch (error) {
+					logger.warn("Failed to persist daemon completion", {
+						name: record.snapshot.name,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		} else {
+			await this.#enqueuePersist(record, false);
+		}
 		await record.log?.close();
 		record.log = undefined;
 		await record.persistQueue;
 		if (
 			completion &&
+			completionDurable &&
 			this.#completionSubscriptions.has(completion.owner) &&
 			record.pendingCompletions.some(pending => pending.completionId === completion.completionId)
 		) {
@@ -1180,6 +1273,7 @@ class DaemonBroker {
 		record.log = await DaemonLog.open(record.dir);
 		record.stopRequested = false;
 		await this.#launch(record);
+		await this.#completionMutations;
 		await record.persistQueue;
 		return { op: "restart", daemon: record.snapshot };
 	}
@@ -1196,6 +1290,124 @@ class DaemonBroker {
 		return condition();
 	}
 
+	async #routeCompletion(operation: Extract<DaemonOperation, { op: "route-completion" }>): Promise<DaemonRpcResult> {
+		const record = this.#record(operation.name);
+		await this.#refreshDetached(record);
+		return this.#withCompletionMutation(() => this.#routeSettledCompletion(record, operation));
+	}
+
+	async #routeSettledCompletion(
+		record: ManagedDaemon,
+		operation: Extract<DaemonOperation, { op: "route-completion" }>,
+	): Promise<DaemonRpcResult> {
+		if (this.#records.get(operation.name) !== record) {
+			throw new Error(`Daemon ${operation.name} is not the captured service generation`);
+		}
+		const currentGeneration = sameDaemonGeneration(record.snapshot, operation.id, operation.startedAt);
+		const generationPending = record.pendingCompletions.filter(completion =>
+			sameDaemonGeneration(completion.daemon, operation.id, operation.startedAt),
+		);
+		if (!currentGeneration && generationPending.length === 0) {
+			throw new Error(`Daemon ${operation.name} is not the captured service generation`);
+		}
+		if (
+			generationPending.some(
+				completion => completion.owner !== operation.fromOwner && completion.owner !== operation.toOwner,
+			)
+		) {
+			throw new Error(`Daemon ${operation.name} is not owned by the continuation source`);
+		}
+		if (currentGeneration && record.completionRoute !== operation.toOwner) {
+			const effectiveOwner = record.completionRoute ?? record.snapshot.owner;
+			if (effectiveOwner !== operation.fromOwner) {
+				throw new Error(`Daemon ${operation.name} is not owned by the continuation source`);
+			}
+		}
+		const alreadyRouted =
+			(!currentGeneration || record.completionRoute === operation.toOwner) &&
+			generationPending.every(completion => completion.owner === operation.toOwner);
+		if (!alreadyRouted) {
+			const previousRoute = record.completionRoute;
+			const previousPending = record.pendingCompletions.map(completion => ({
+				...completion,
+				daemon: { ...completion.daemon },
+			}));
+			const previousCapable = record.completionCapable;
+			const previousSubscriptionId = record.completionSubscriptionId;
+			const previousFrom = cloneCompletionMap(this.#pendingCompletions.get(operation.fromOwner));
+			const previousTo = cloneCompletionMap(this.#pendingCompletions.get(operation.toOwner));
+			if (currentGeneration) {
+				record.completionRoute = operation.toOwner;
+				record.completionCapable =
+					this.#completionSubscriptions.has(operation.toOwner) ||
+					this.#completionSubscriptions.has(operation.fromOwner);
+				record.completionSubscriptionId =
+					this.#completionSubscriptions.get(operation.toOwner) ??
+					this.#completionSubscriptions.get(operation.fromOwner);
+			}
+			this.#rewireDaemonCompletions(
+				record,
+				operation.fromOwner,
+				operation.toOwner,
+				operation.id,
+				operation.startedAt,
+			);
+			try {
+				await this.#persistRequired(record);
+			} catch (error) {
+				record.completionRoute = previousRoute;
+				record.pendingCompletions = previousPending;
+				record.completionCapable = previousCapable;
+				record.completionSubscriptionId = previousSubscriptionId;
+				restoreCompletionMap(this.#pendingCompletions, operation.fromOwner, previousFrom);
+				restoreCompletionMap(this.#pendingCompletions, operation.toOwner, previousTo);
+				throw error;
+			}
+		}
+		const registration = this.#ownerSockets.get(operation.toOwner);
+		if (registration && !registration.socket.destroyed) {
+			for (const completion of this.#pendingCompletions.get(operation.toOwner)?.values() ?? []) {
+				if (sameDaemonGeneration(completion.daemon, operation.id, operation.startedAt)) {
+					registration.socket.write(`${JSON.stringify(completion)}\n`);
+				}
+			}
+		}
+		return { op: "route-completion", daemon: record.snapshot, routedOwner: operation.toOwner };
+	}
+
+	#rewireDaemonCompletions(
+		record: ManagedDaemon,
+		fromOwner: string,
+		toOwner: string,
+		id: string,
+		startedAt: number,
+	): void {
+		const fromPending = this.#pendingCompletions.get(fromOwner);
+		if (fromPending) {
+			for (const [completionId, completion] of fromPending) {
+				if (!sameDaemonGeneration(completion.daemon, id, startedAt)) continue;
+				fromPending.delete(completionId);
+				const routed = { ...completion, owner: toOwner };
+				const toPending = this.#pendingCompletions.get(toOwner) ?? new Map();
+				toPending.set(completionId, routed);
+				this.#pendingCompletions.set(toOwner, toPending);
+			}
+			if (fromPending.size === 0) this.#pendingCompletions.delete(fromOwner);
+		}
+		record.pendingCompletions = record.pendingCompletions.map(completion =>
+			sameDaemonGeneration(completion.daemon, id, startedAt) && completion.owner === fromOwner
+				? { ...completion, owner: toOwner }
+				: completion,
+		);
+		const toPending = this.#pendingCompletions.get(toOwner) ?? new Map();
+		for (const completion of record.pendingCompletions) {
+			if (sameDaemonGeneration(completion.daemon, id, startedAt) && completion.owner === toOwner) {
+				toPending.set(completion.completionId, completion);
+			}
+		}
+		if (toPending.size > 0) this.#pendingCompletions.set(toOwner, toPending);
+	}
+
 	#record(name: string): ManagedDaemon {
 		const record = this.#records.get(name);
 		if (record) return record;
@@ -1203,7 +1415,31 @@ class DaemonBroker {
 		throw new Error(`Unknown daemon ${name}${names.length ? `. Available: ${names.join(", ")}` : ""}`);
 	}
 
+	#listedPendingCompletions(): DaemonCompletionNotification[] {
+		const pending: DaemonCompletionNotification[] = [];
+		for (const record of this.#records.values()) {
+			pending.push(...record.pendingCompletions);
+		}
+		pending.sort(
+			(left, right) =>
+				left.daemon.name.localeCompare(right.daemon.name) ||
+				left.daemon.startedAt - right.daemon.startedAt ||
+				left.completionId.localeCompare(right.completionId),
+		);
+		return pending;
+	}
+
 	#persist(record: ManagedDaemon): void {
+		// Ordinary snapshots must not capture an ACK or route halfway through
+		// its mutation/persist/rollback transaction.
+		void this.#withCompletionMutation(() => this.#enqueuePersist(record, false));
+	}
+
+	#persistRequired(record: ManagedDaemon): Promise<void> {
+		return this.#enqueuePersist(record, true);
+	}
+
+	#enqueuePersist(record: ManagedDaemon, required: boolean): Promise<void> {
 		const metaPath = path.join(record.dir, META_FILE);
 		const tempPath = `${metaPath}.${process.pid}.tmp`;
 		const metadata = {
@@ -1211,6 +1447,7 @@ class DaemonBroker {
 			spec: record.spec,
 			completionEvents: record.completionCapable,
 			completionSubscriptionId: record.completionSubscriptionId,
+			...(record.completionRoute ? { completionRoute: record.completionRoute } : {}),
 			completionPending: record.pendingCompletions.length > 0,
 			pendingCompletion: record.pendingCompletions.at(-1)?.daemon,
 			pendingCompletions: record.pendingCompletions.map(completion => ({
@@ -1218,39 +1455,70 @@ class DaemonBroker {
 				daemon: { ...completion.daemon },
 			})),
 		};
-		record.persistQueue = record.persistQueue
-			.then(async () => {
-				await Bun.write(tempPath, JSON.stringify(metadata));
-				await fs.rename(tempPath, metaPath);
-			})
-			.catch(error => {
-				logger.warn("Failed to persist daemon metadata", {
-					name: record.snapshot.name,
-					error: error instanceof Error ? error.message : String(error),
-				});
+		const write = async (): Promise<void> => {
+			await Bun.write(tempPath, JSON.stringify(metadata));
+			if (required) await syncPath(tempPath);
+			await fs.rename(tempPath, metaPath);
+			if (required) {
+				await syncPath(metaPath);
+				await syncPath(record.dir);
+			}
+		};
+		const run = record.persistQueue.then(write, write);
+		record.persistQueue = run.catch(error => {
+			logger.warn("Failed to persist daemon metadata", {
+				name: record.snapshot.name,
+				error: error instanceof Error ? error.message : String(error),
 			});
+		});
+		return required ? run : record.persistQueue;
 	}
 
-	async #setRecordCompletionCapability(owner: string, capable: boolean): Promise<void> {
-		const subscriptionId = capable ? this.#completionSubscriptions.get(owner) : undefined;
+	async #setRecordCompletionCapability(owner: string): Promise<void> {
 		const persistence: Promise<void>[] = [];
-		for (const record of this.#records.values()) {
-			const clearPendingCompletions = !capable && record.pendingCompletions.length > 0;
-			if (
-				record.snapshot.owner !== owner ||
-				(record.completionCapable === capable &&
+		const rollbacks: Array<() => void> = [];
+		try {
+			for (const record of this.#records.values()) {
+				const owners = [record.snapshot.owner, record.completionRoute].filter(
+					(value): value is string => value !== undefined,
+				);
+				if (!owners.includes(owner)) continue;
+				const capableNow = owners.some(item => this.#completionSubscriptions.has(item));
+				const subscriptionId = capableNow
+					? (this.#completionSubscriptions.get(record.completionRoute ?? "") ??
+						this.#completionSubscriptions.get(record.snapshot.owner ?? ""))
+					: undefined;
+				if (
+					record.completionCapable === capableNow &&
 					record.completionSubscriptionId === subscriptionId &&
-					!clearPendingCompletions)
-			) {
-				continue;
+					(capableNow || record.pendingCompletions.length === 0)
+				) {
+					continue;
+				}
+				const previousPending = record.pendingCompletions;
+				const previousCapable = record.completionCapable;
+				const previousSubscriptionId = record.completionSubscriptionId;
+				record.completionCapable = capableNow;
+				record.completionSubscriptionId = subscriptionId;
+				if (!capableNow) {
+					record.pendingCompletions = record.pendingCompletions.filter(completion => completion.owner !== owner);
+				}
+				rollbacks.push(() => {
+					record.pendingCompletions = previousPending;
+					record.completionCapable = previousCapable;
+					record.completionSubscriptionId = previousSubscriptionId;
+				});
+				if (previousPending.length !== record.pendingCompletions.length) {
+					persistence.push(this.#persistRequired(record));
+				} else {
+					persistence.push(this.#enqueuePersist(record, false));
+				}
 			}
-			record.completionCapable = capable;
-			record.completionSubscriptionId = subscriptionId;
-			if (!capable) record.pendingCompletions = [];
-			this.#persist(record);
-			persistence.push(record.persistQueue);
+			await Promise.all(persistence);
+		} catch (error) {
+			for (const rollback of rollbacks) rollback();
+			throw error;
 		}
-		await Promise.all(persistence);
 	}
 
 	async #recoverRecords(): Promise<void> {
@@ -1286,6 +1554,12 @@ class DaemonBroker {
 				}
 				snapshot.persist = spec.persist;
 				snapshot.detached = spec.detached;
+				const completionRoute =
+					"completionRoute" in decoded &&
+					typeof decoded.completionRoute === "string" &&
+					decoded.completionRoute.trim().length > 0
+						? decoded.completionRoute
+						: undefined;
 				const record: ManagedDaemon = {
 					spec,
 					snapshot,
@@ -1323,25 +1597,30 @@ class DaemonBroker {
 									{
 										event: "daemon-completed",
 										completionId: crypto.randomUUID(),
-										owner: pendingSnapshot.owner ?? snapshot.owner ?? "",
+										owner: completionRoute ?? pendingSnapshot.owner ?? snapshot.owner ?? "",
 										daemon: pendingSnapshot,
 									},
 								]
 							: [];
 					})(),
+					...(completionRoute ? { completionRoute } : {}),
 				};
-				if (recoveredDead && record.completionCapable && snapshot.owner && record.pendingCompletions.length === 0) {
+				const recoveredOwner = record.completionRoute ?? snapshot.owner;
+				if (recoveredDead && record.completionCapable && recoveredOwner && record.pendingCompletions.length === 0) {
 					record.pendingCompletions.push({
 						event: "daemon-completed",
 						completionId: crypto.randomUUID(),
-						owner: snapshot.owner,
+						owner: recoveredOwner,
 						daemon: { ...snapshot },
 					});
 				}
 				syncReadyPending(record);
 				this.#records.set(snapshot.name, record);
-				if (snapshot.owner && record.completionCapable && (detached || record.pendingCompletions.length > 0)) {
-					this.#completionSubscriptions.set(snapshot.owner, record.completionSubscriptionId);
+				if (record.completionCapable && (detached || record.pendingCompletions.length > 0)) {
+					if (snapshot.owner) this.#completionSubscriptions.set(snapshot.owner, record.completionSubscriptionId);
+					if (record.completionRoute) {
+						this.#completionSubscriptions.set(record.completionRoute, record.completionSubscriptionId);
+					}
 				}
 				if (record.completionCapable) {
 					for (const completion of record.pendingCompletions) this.#notifyCompletion(completion);

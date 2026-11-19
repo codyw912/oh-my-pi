@@ -1,6 +1,6 @@
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
-import { type ApiKeyResolver, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { type ApiKeyResolver, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import type { Mnemopi } from "@oh-my-pi/pi-mnemopi";
 import type { MnemopiLlmCompleteOptions } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
@@ -19,6 +19,7 @@ import type {
 import memoryConsolidationPrompt from "../prompts/system/memory-consolidation-system.md" with { type: "text" };
 import memoryExtractionPrompt from "../prompts/system/memory-extraction-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { completeImplFromEnrollment, rejectEnrolledUnsupportedInference } from "../session/continuation-complete";
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "../tools/render-utils";
@@ -127,7 +128,7 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
+			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId, session);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			await installMnemopiState(session, config);
 		} catch (error) {
@@ -183,6 +184,7 @@ export const mnemopiBackend: MemoryBackend = {
 					agentDir,
 					session.modelRegistry,
 					session.sessionId,
+					session,
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
@@ -479,9 +481,10 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	session?: AgentSession,
 ): Promise<MnemopiBackendConfig> {
 	const config = loadMnemopiConfig(settings, agentDir);
-	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId);
+	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId, session);
 	return config;
 }
 
@@ -509,6 +512,7 @@ async function resolveMnemopiProviderOptions(
 	settings: MemoryBackendStartOptions["settings"],
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	session?: AgentSession,
 ): Promise<MnemopiProviderOptions> {
 	const base: MnemopiProviderOptions = {
 		noEmbeddings: config.providerOptions.noEmbeddings,
@@ -528,6 +532,10 @@ async function resolveMnemopiProviderOptions(
 	// model the line-format extraction + hardened consolidation recipes from the spike.
 	const memoryModel = settings.get("providers.memoryModel");
 	if (memoryModel !== ONLINE_MEMORY_MODEL_KEY && isTinyMemoryLocalModelKey(memoryModel)) {
+		rejectEnrolledUnsupportedInference(
+			session?.continuationFactory !== undefined,
+			"Continuation HTTP admission is unsupported for local tiny memory inference",
+		);
 		return {
 			...base,
 			llm: {
@@ -538,9 +546,6 @@ async function resolveMnemopiProviderOptions(
 						systemPrompt: request.systemPrompt,
 					});
 				},
-				// No `extractionPrompt`: resolveMemoryCompletionInput supplies the
-				// instructions as a system turn for every extraction call, so anything
-				// rendered here would be built in code and then discarded.
 				consolidationPrompt: memoryConsolidationPrompt,
 			},
 		};
@@ -579,8 +584,12 @@ async function resolveMnemopiProviderOptions(
 					});
 					return null;
 				}
+				const complete = completeImplFromEnrollment(
+					session?.inferenceStreamFn,
+					session?.continuationFactory !== undefined,
+				);
 				const message = await retryTransientCompletion(() =>
-					completeSimple(
+					complete(
 						model,
 						{
 							...(request.systemPrompt ? { systemPrompt: [request.systemPrompt] } : {}),

@@ -64,6 +64,7 @@ import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
+import type { WorkProjectionV1 } from "../../session/continuation-work";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -1356,7 +1357,7 @@ export interface ExtensionAPI {
 	registerFileDeleteFallback(handler: FileDeleteFallbackHandler): void;
 
 	// =========================================================================
-	// Command, Shortcut, Flag Registration
+	// Command, Workflow, Shortcut, Flag Registration
 	// =========================================================================
 
 	/** Register a custom command. */
@@ -1368,6 +1369,9 @@ export interface ExtensionAPI {
 			handler: RegisteredCommand["handler"];
 		},
 	): void;
+
+	/** Register an inert, read-only work exporter. This does not enroll or resume a run. */
+	registerContinuationWorkflow(workflow: ContinuationWorkflow): void;
 
 	/** Register a keyboard shortcut. */
 	registerShortcut(
@@ -1682,6 +1686,16 @@ export type GetServiceTiersHandler = () => ServiceTierByFamily;
 
 export type SetServiceTierHandler = (family: ServiceTierFamily, tier: ServiceTier | undefined) => void;
 
+export interface ContinuationWorkflow {
+	readonly id: string;
+	exportProjection(context: { cwd: string; planPath: string }): Promise<WorkProjectionV1>;
+}
+
+export interface RegisteredContinuationWorkflow {
+	readonly definition: Readonly<ContinuationWorkflow>;
+	readonly extensionPath: string;
+}
+
 /** Shared state created by loader, used during registration and runtime. */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
@@ -1753,6 +1767,7 @@ export interface Extension {
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
+	continuationWorkflows?: Map<string, RegisteredContinuationWorkflow>;
 	assistantThinkingRenderers: AssistantThinkingRenderer[];
 	fileWriteFallbackHandlers: FileWriteFallbackHandler[];
 	fileDeleteFallbackHandlers: FileDeleteFallbackHandler[];

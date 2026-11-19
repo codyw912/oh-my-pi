@@ -5271,6 +5271,44 @@ describe("advisor", () => {
 			expect(promptText(promptInputs[1])).toContain("keep me");
 		});
 
+		it("lets active advisor work settle without abort or replay during quiescent continuation", async () => {
+			const entered = Promise.withResolvers<void>();
+			const completed = Promise.withResolvers<void>();
+			let prompts = 0;
+			let aborts = 0;
+			const messages: AgentMessage[] = [{ role: "user", content: "finish the current review", timestamp: 1 }];
+			const runtime = new AdvisorRuntime(
+				{
+					prompt: async () => {
+						prompts++;
+						entered.resolve();
+						await completed.promise;
+					},
+					abort: () => {
+						aborts++;
+					},
+					reset: () => {},
+					state: { messages: [] },
+				},
+				{ snapshotMessages: () => messages, enqueueAdvice: () => {} },
+			);
+			try {
+				runtime.onTurnEnd(messages);
+				await entered.promise;
+				const paused = runtime.pauseForSessionTransition({ abortActive: false });
+				expect(aborts).toBe(0);
+				completed.resolve();
+				await paused;
+				runtime.resumeAfterSessionTransition();
+				await settleUntil(() => runtime.backlog === 0);
+				expect(prompts).toBe(1);
+				expect(aborts).toBe(0);
+			} finally {
+				completed.resolve();
+				runtime.dispose();
+			}
+		});
+
 		it("re-expands first-time primary context after a session transition pauses before dispatch", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const planRule = "Plan mode is active. Keep this first delivery expanded.";

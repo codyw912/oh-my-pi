@@ -119,3 +119,46 @@ describe("regex-derived protocol fields", () => {
 		});
 	});
 });
+
+describe("launch list pending completions", () => {
+	const listOperation: Extract<DaemonOperation, { op: "list" }> = { op: "list" };
+	const pending = {
+		event: "daemon-completed" as const,
+		completionId: "completion-1",
+		owner: "source-owner",
+		daemon: { ...baseSnapshot, state: "exited" as const, startedAt: 7 },
+	};
+
+	it("keeps pendingCompletions optional for legacy list results", () => {
+		expect(parseDaemonRpcResult(listOperation, { daemons: [baseSnapshot] })).toEqual({
+			op: "list",
+			daemons: [parseDaemonSnapshot(baseSnapshot)],
+			pendingCompletions: undefined,
+		});
+	});
+
+	it("decodes pending completions without attaching them to snapshots", () => {
+		const result = parseDaemonRpcResult(listOperation, {
+			daemons: [baseSnapshot],
+			pendingCompletions: [pending],
+		});
+		expect(result).toEqual({
+			op: "list",
+			daemons: [parseDaemonSnapshot(baseSnapshot)],
+			pendingCompletions: [
+				{
+					event: "daemon-completed",
+					completionId: "completion-1",
+					owner: "source-owner",
+					daemon: parseDaemonSnapshot(pending.daemon),
+				},
+			],
+		});
+	});
+
+	it("rejects a non-array pendingCompletions payload", () => {
+		expect(() => parseDaemonRpcResult(listOperation, { daemons: [], pendingCompletions: pending })).toThrow(
+			"result.pendingCompletions must be an array",
+		);
+	});
+});

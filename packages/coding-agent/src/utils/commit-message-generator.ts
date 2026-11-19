@@ -12,6 +12,7 @@ import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import commitSystemPrompt from "../prompts/system/commit-message-system.md" with { type: "text" };
+import { ContinuationRequestBoundaryError } from "../session/continuation-request";
 import { concreteThinkingLevel, toReasoningEffort } from "../thinking";
 
 const COMMIT_SYSTEM_PROMPT = prompt.render(commitSystemPrompt);
@@ -84,6 +85,7 @@ export async function generateCommitMessage(
 	registry: ModelRegistry,
 	settings: Settings,
 	sessionId?: string,
+	completeImpl: typeof completeSimple = completeSimple,
 ): Promise<string | null> {
 	const candidates = getSmolModelCandidates(registry, settings);
 	if (candidates.length === 0) {
@@ -107,7 +109,7 @@ export async function generateCommitMessage(
 		try {
 			const maxTokens = COMMIT_MAX_TOKENS;
 			const response = await retryTransientCompletion(() =>
-				completeSimple(
+				completeImpl(
 					candidate.model,
 					{
 						systemPrompt: [COMMIT_SYSTEM_PROMPT],
@@ -140,6 +142,7 @@ export async function generateCommitMessage(
 			logger.debug("commit-msg-generator: generated", { model: candidate.model.id, msg });
 			return msg;
 		} catch (err) {
+			if (err instanceof ContinuationRequestBoundaryError) return null;
 			logger.debug("commit-msg-generator: error", {
 				model: candidate.model.id,
 				error: err instanceof Error ? err.message : String(err),

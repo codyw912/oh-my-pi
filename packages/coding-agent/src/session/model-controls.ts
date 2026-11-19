@@ -1,4 +1,4 @@
-import { type Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type Agent, type StreamFn, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model, ProviderSessionState, ServiceTier, ServiceTierByFamily, ServiceTierFamily } from "@oh-my-pi/pi-ai";
 import {
 	clearAnthropicFastModeFallback,
@@ -36,6 +36,7 @@ import {
 } from "../thinking";
 import type { EditMode } from "../utils/edit-mode";
 import type { AgentSessionEvent } from "./agent-session-events";
+import { ContinuationRequestBoundaryError } from "./continuation-request";
 import type { ModelCycleResult, ResolvedRoleModel, RoleModelCycle, RoleModelCycleResult } from "./agent-session-types";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
@@ -60,6 +61,7 @@ export interface ModelControlsHost {
 	emit(event: AgentSessionEvent): void;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	inferenceStreamFn?(): StreamFn | undefined;
 }
 
 /** Owns model selection, thinking effort, role cycling, and service tiers. */
@@ -624,6 +626,7 @@ export class ModelControls {
 					sessionId: this.#host.sessionId(),
 					signal: controller.signal,
 					metadataResolver: provider => this.#host.agent.metadataForProvider(provider),
+					streamFn: this.#host.inferenceStreamFn?.(),
 					onUsage: usage => {
 						const entryId = this.#host.sessionManager.appendModelUsage(
 							{ purpose: "auto-thinking", ...usage },
@@ -633,6 +636,7 @@ export class ModelControls {
 					},
 				});
 			} catch (error) {
+				if (error instanceof ContinuationRequestBoundaryError) throw error;
 				logger.debug("auto-thinking: classification failed; using fallback level", {
 					error: error instanceof Error ? error.message : String(error),
 				});

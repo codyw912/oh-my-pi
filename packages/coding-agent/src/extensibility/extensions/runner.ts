@@ -54,6 +54,7 @@ import type {
 	McpNotificationEvent,
 	MessageRenderer,
 	RegisteredCommand,
+	RegisteredContinuationWorkflow,
 	RegisteredTool,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
@@ -904,6 +905,22 @@ export class ExtensionRunner {
 			if (tool) return tool;
 		}
 		return undefined;
+	}
+
+	/** Work authority is explicit: conflicting exporters cannot use tool-style last-wins precedence. */
+	getContinuationWorkflow(id: string): RegisteredContinuationWorkflow | undefined {
+		let selected: RegisteredContinuationWorkflow | undefined;
+		for (const extension of this.extensions) {
+			const workflow = extension.continuationWorkflows?.get(id);
+			if (!workflow) continue;
+			if (selected) {
+				throw new Error(
+					`Ambiguous continuation workflow ${id}: ${selected.extensionPath} and ${workflow.extensionPath}`,
+				);
+			}
+			selected = workflow;
+		}
+		return selected;
 	}
 
 	/**

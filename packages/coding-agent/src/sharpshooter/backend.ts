@@ -86,6 +86,8 @@ export const sharpshooterBackend: MemoryBackend = {
 				settings,
 				modelRegistry,
 				sessionId: session.sessionId,
+				inferenceStreamFn: session.inferenceStreamFn,
+				enrolled: session.continuationFactory !== undefined,
 			});
 			try {
 				const unsubscribe = session.subscribe(event => {
@@ -141,6 +143,8 @@ export const sharpshooterBackend: MemoryBackend = {
 			modelRegistry: session.modelRegistry,
 			sessionId: session.sessionId,
 			force: true,
+			inferenceStreamFn: session.inferenceStreamFn,
+			enrolled: session.continuationFactory !== undefined,
 		});
 	},
 

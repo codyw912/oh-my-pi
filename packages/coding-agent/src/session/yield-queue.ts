@@ -102,6 +102,15 @@ export class YieldQueue {
 		return false;
 	}
 
+	/** Rewrite queued entries of one kind in place without draining or acking them. */
+	rewrite<P>(kind: string, rewrite: (entry: P) => P): void {
+		const entries = this.#entries.get(kind);
+		if (!entries) return;
+		for (const entry of entries) {
+			entry.value = rewrite(entry.value as P);
+		}
+	}
+
 	/** Arrange an idle flush for entries queued near the end of a streaming run. */
 	requestIdleFlush(): void {
 		for (const [kind, dispatcher] of this.#dispatchers) {

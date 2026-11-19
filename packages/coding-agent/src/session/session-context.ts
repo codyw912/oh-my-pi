@@ -17,7 +17,13 @@ import {
 	PREWALK_PLAN_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { type CompactionEntry, EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
+import {
+	type CompactionEntry,
+	CONTINUATION_BRIEFING_CUSTOM_TYPE,
+	CONTINUATION_PROTECTED_CONTEXT_TYPE,
+	EPHEMERAL_MODEL_CHANGE_ROLE,
+	type SessionEntry,
+} from "./session-entries";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -424,6 +430,44 @@ export function buildSessionContext(
 	} else if (compaction) {
 		const providerPayload = getOpenAiRemoteCompactionPayload(compaction);
 		const remoteReplacementHistory = providerPayload?.items;
+		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
+		const protection = path.findLast(
+			entry => entry.type === "custom" && entry.customType === CONTINUATION_PROTECTED_CONTEXT_TYPE,
+		);
+		if (protection?.type === "custom") {
+			const data = protection.data;
+			if (!isRecord(data) || data.version !== 1 || !Array.isArray(data.entryIds) || data.entryIds.length === 0) {
+				throw new Error("Malformed protected continuation context");
+			}
+			const protectedIds = new Set<string>();
+			for (const id of data.entryIds) {
+				const entry = typeof id === "string" && seenPathIds.has(id) ? byId.get(id) : undefined;
+				if (
+					!entry ||
+					!(
+						(entry.type === "custom_message" && entry.customType === CONTINUATION_BRIEFING_CUSTOM_TYPE) ||
+						(entry.type === "message" && (entry.message.role === "user" || entry.message.role === "developer"))
+					)
+				) {
+					throw new Error("Protected continuation context is missing or refers to nonportable history");
+				}
+				protectedIds.add(entry.id);
+			}
+			let elidedUntil = compactionIdx;
+			if (remoteReplacementHistory && !options?.transcript) {
+				const through = path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId);
+				if (through >= 0 && through < compactionIdx) elidedUntil = through + 1;
+			} else {
+				const firstKept = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+				if (firstKept >= 0 && firstKept < compactionIdx) elidedUntil = firstKept;
+			}
+			// Retain historical checkpoint inputs before the newer summary. Entries
+			// already in the kept tail retain their order and are not duplicated.
+			for (let index = 0; index < elidedUntil; index++) {
+				const entry = path[index]!;
+				if (protectedIds.has(entry.id)) appendMessage(entry);
+			}
+		}
 
 		// Re-attach any archived snapcompact frames so the model can keep
 		// reading the archived history after every context rebuild.
@@ -446,9 +490,6 @@ export function buildSessionContext(
 		if (!options?.transcript) {
 			pushMessage(compactionSummaryMsg);
 		}
-
-		// Find compaction index in path
-		const compactionIdx = path.findIndex(e => e.type === "compaction" && e.id === compaction.id);
 
 		// The remote replacement payload (OpenAI remote compaction) carries the
 		// kept turns for the LLM context only; it is not rendered as visible

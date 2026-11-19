@@ -1,6 +1,6 @@
 /** Provider-facing message, image, secret, and stream normalization for a session. */
 
-import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Agent, AgentMessage, StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, Model, SimpleStreamOptions, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
@@ -10,6 +10,8 @@ import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { validateProviderMaxInFlightRequests } from "../config/settings";
 import type { LocalProtocolOptions } from "../internal-urls";
+import type { ContinuationBindingFactory } from "./continuation-binding";
+import { completeImplFromEnrollment } from "./continuation-complete";
 import { deobfuscateSessionContext, obfuscateMessages } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { stripPendingSecretPlaceholderSuffix } from "../secrets/placeholder";
@@ -38,6 +40,8 @@ export interface SessionProviderBoundaryHost {
 	onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
 	obfuscator: SecretObfuscator | undefined;
+	inferenceStreamFn?(): StreamFn | undefined;
+	continuationFactory?(): ContinuationBindingFactory | undefined;
 }
 
 /** Owns the transformations at the session/provider boundary. */
@@ -245,6 +249,10 @@ export class SessionProviderBoundary {
 					activeModelString: formatModelString(model),
 					telemetryConfig: this.#host.agent.telemetry,
 					sessionId: this.#host.sessionId(),
+					completeImpl: completeImplFromEnrollment(
+						this.#host.inferenceStreamFn?.(),
+						this.#host.continuationFactory?.() !== undefined,
+					),
 				},
 				signal,
 			);

@@ -318,7 +318,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 			case "jobs": {
 				const manager = this.session.asyncJobManager;
 				if (!manager) return this.#asyncDisabled("jobs");
-				return executeJobsSnapshot(this.session, manager, this.#ownerId());
+				return await executeJobsSnapshot(this.session, manager, this.#ownerId());
 			}
 			case "start":
 			case "ps":
@@ -395,7 +395,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		const runningJobs = jobsToWatch.filter(j => j.status === "running");
 		if (manager && jobsToWatch.length > 0 && runningJobs.length === 0) {
 			// Every explicitly watched job already settled — immediate snapshot.
-			return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
+			return await buildJobResult(this.session, manager, "wait", jobsToWatch, []);
 		}
 
 		if (!manager || runningJobs.length === 0) {
@@ -514,7 +514,7 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 			if (settled.message) return messageResult(messaging.senderId, settled.message);
 		}
 
-		return buildJobResult(this.session, manager, "wait", jobsToWatch, []);
+		return await buildJobResult(this.session, manager, "wait", jobsToWatch, []);
 	}
 }
 

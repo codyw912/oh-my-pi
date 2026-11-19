@@ -55,6 +55,27 @@ export interface WriteTextAtomicOptions {
 	commitGuard?: () => boolean;
 }
 
+/** File-backed OS sync is the only continuation durability this runtime supports. */
+export type SessionStorageContinuationDurability =
+	| { kind: "file-backed-os-sync" }
+	| {
+			kind: "unsupported";
+			backend: "memory" | "indexed";
+			reason: string;
+	  };
+
+export const UNSUPPORTED_MEMORY_CONTINUATION_DURABILITY = {
+	kind: "unsupported",
+	backend: "memory",
+	reason: "Memory session storage has no OS-synchronized local files for continuation recovery.",
+} as const satisfies SessionStorageContinuationDurability;
+
+export const UNSUPPORTED_INDEXED_CONTINUATION_DURABILITY = {
+	kind: "unsupported",
+	backend: "indexed",
+	reason: "Indexed/remote session storage cannot supply file-backed OS-synchronized continuation evidence.",
+} as const satisfies SessionStorageContinuationDurability;
+
 export interface SessionStorage {
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
@@ -89,6 +110,12 @@ export interface SessionStorage {
 	 * `writeTextSync` publish is still on the wire.
 	 */
 	drain(): Promise<void>;
+	/**
+	 * Explicit continuation durability capability. File-backed storage reports
+	 * OS-synchronized local files; memory/indexed/remote backends must reject
+	 * this feature rather than pretending `drain()`/`flush()` is fsync.
+	 */
+	continuationDurability(): SessionStorageContinuationDurability;
 }
 
 // FinalizationRegistry to clean up leaked file descriptors
@@ -438,6 +465,59 @@ export class FileSessionStorage implements SessionStorage {
 		return Promise.resolve();
 	}
 
+	continuationDurability(): SessionStorageContinuationDurability {
+		return { kind: "file-backed-os-sync" };
+	}
+
+	/**
+	 * `fsync` a regular file. Ordinary {@link SessionStorageWriter.flush} is not this.
+	 * Tests may override to inject sync failures.
+	 */
+	syncFile(filePath: string): void {
+		const fd = fs.openSync(filePath, "r");
+		try {
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
+	/**
+	 * `fsync` a directory. Tests may override to inject sync failures.
+	 */
+	syncDir(dirPath: string): void {
+		const fd = fs.openSync(dirPath, "r");
+		try {
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
+	/**
+	 * Read an exact byte range. Tests may override to inject short reads.
+	 */
+	readFileRange(filePath: string, offset: number, byteLength: number): Uint8Array {
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const buf = Buffer.alloc(byteLength);
+			let read = 0;
+			while (read < byteLength) {
+				const n = fs.readSync(fd, buf, read, byteLength - read, offset + read);
+				if (n === 0) break;
+				read += n;
+			}
+			if (read !== byteLength) {
+				throw new Error(
+					`Short read from ${filePath}: expected ${byteLength} bytes at offset ${offset}, got ${read}`,
+				);
+			}
+			return buf;
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
 		return new FileSessionStorageWriter(path, options);
 	}
@@ -694,6 +774,10 @@ export class MemorySessionStorage implements SessionStorage {
 			path,
 			createMemoryFileEntry(overlayTitleSlotContent(materializeMemoryEntry(entry), update), Date.now()),
 		);
+	}
+
+	continuationDurability(): SessionStorageContinuationDurability {
+		return UNSUPPORTED_MEMORY_CONTINUATION_DURABILITY;
 	}
 
 	/**

@@ -98,6 +98,8 @@ import type { CompactionEntry, SessionEntry } from "./session-entries";
 import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
+import type { ContinuationSessionBinding } from "./continuation-binding";
+import { bindContinuationStream, registerContinuationTransport } from "./continuation-request";
 import type { YieldQueue } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
@@ -286,6 +288,7 @@ export interface SessionAdvisorsHost {
 		phase: CodexCompactionContext["phase"];
 	}): CodexCompactionContext;
 	sessionId(): string;
+	continuationBinding?(): ContinuationSessionBinding | undefined;
 }
 
 /**
@@ -432,6 +435,13 @@ export class SessionAdvisors {
 	async drainAndDetachRecorders(): Promise<void> {
 		await Promise.all(this.#advisors.map(advisor => advisor.runtime.pauseForSessionTransition()));
 		await this.detachAndCloseRecorders();
+	}
+
+	/** Freeze new work without aborting active prompts or detaching their recorders. */
+	async pauseForContinuation(): Promise<void> {
+		await Promise.all(
+			this.#advisors.map(advisor => advisor.runtime.pauseForSessionTransition({ abortActive: false })),
+		);
 	}
 
 	/** Detaches and drains recorder feeds before transcript artifacts are removed. */
@@ -960,6 +970,8 @@ export class SessionAdvisors {
 				}
 				return baseAdvisorStreamFn(requestModel, context, options);
 			};
+			const advisorBinding = this.#host.continuationBinding?.()?.forRole("advisor", slug);
+			if (advisorBinding) registerContinuationTransport(advisorStreamFn, baseAdvisorStreamFn);
 			const advisorAgent = new Agent({
 				initialState: {
 					systemPrompt,
@@ -975,7 +987,9 @@ export class SessionAdvisors {
 				cwdResolver: () => this.#host.sessionManager.getCwd(),
 				preferWebsockets: this.#host.preferWebsockets,
 				getApiKey: requestModel => this.#host.modelRegistry.resolver(requestModel, advisorProviderSessionId),
-				streamFn: advisorStreamFn,
+				streamFn: advisorBinding
+					? bindContinuationStream(advisorStreamFn, advisorBinding.requestBoundary, advisorBinding.role)
+					: advisorStreamFn,
 				onPayload: this.#host.onPayload,
 				onResponse: this.#host.onResponse,
 				onSseEvent: this.#host.onSseEvent,
@@ -993,6 +1007,7 @@ export class SessionAdvisors {
 				serviceTierResolver: advisorServiceTierResolver,
 			});
 			advisorAgent.setDisableReasoning(shouldDisableReasoning(advisorThinkingLevel));
+			if (advisorBinding) advisorAgent.setToolExecutionBoundary(advisorBinding.toolBoundary);
 			let advisorLoopGuardStopped = false;
 			// The advisor's own loop needs the same repeated-tool-call bound the
 			// primary gets from `LoopGuards`; nothing else stops it reissuing one

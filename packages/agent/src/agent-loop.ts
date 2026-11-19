@@ -84,8 +84,14 @@ import type {
 	SteeringInterruptSource,
 	SteeringQueueState,
 	StreamFn,
+	ToolExecutionAdmission,
 } from "./types";
-import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, isSoftToolRequirement } from "./types";
+import {
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	isSoftToolRequirement,
+	ToolExecutionBoundaryError,
+} from "./types";
 import { yieldIfDue } from "./utils/yield";
 
 /** Stop-details marker for a provider error after assistant content/tool args already streamed. */
@@ -1114,6 +1120,7 @@ async function runLoopBody(
 				currentContext.messages.push(result);
 				newMessages.push(result);
 			}
+			if (executionResult.boundaryFault) throw executionResult.boundaryFault;
 			await emitTurnEnd(stream, currentContext, resumeTail, executionResult.toolResults, config, signal, {
 				willContinue: !isDeadlineExceeded(config.deadline),
 			});
@@ -1451,6 +1458,7 @@ async function runLoopBody(
 						currentContext.messages.push(result);
 						newMessages.push(result);
 					}
+					if (executionResult.boundaryFault) throw executionResult.boundaryFault;
 				} else if (toolCalls.length > 0) {
 					// Turn ended on a non-runnable reason (`length` truncation) or deadline was exceeded
 					// but left toolCall blocks behind. pair each with a placeholder result.
@@ -2361,6 +2369,14 @@ async function prepareToolCallDispatch(
 	}
 	return prepared;
 }
+
+function toToolExecutionBoundaryError(error: unknown): ToolExecutionBoundaryError {
+	if (error instanceof ToolExecutionBoundaryError) return error;
+	const message =
+		error instanceof Error && error.message.length > 0 ? error.message : "Tool execution boundary failed";
+	return new ToolExecutionBoundaryError(message, { cause: error });
+}
+
 /**
  * Execute tool calls from an assistant message.
  */
@@ -2372,7 +2388,7 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
-): Promise<{ toolResults: ToolResultMessage[] }> {
+): Promise<{ toolResults: ToolResultMessage[]; boundaryFault?: ToolExecutionBoundaryError }> {
 	const tools = currentContext.tools;
 	const {
 		hasSteeringMessages,
@@ -2383,6 +2399,7 @@ async function executeToolCalls(
 		resolveFallbackTool,
 		afterToolCall,
 	} = config;
+	let boundaryFault: ToolExecutionBoundaryError | undefined;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 	// Defensive: the outer loop already filters exec-resolved blocks before
 	// deciding to invoke `executeToolCalls`, but skip them here too so the
@@ -2609,6 +2626,9 @@ async function executeToolCalls(
 			emitToolResult(record, createToolSignalAbortedResult(record.signal), true);
 			return;
 		}
+		if (config.toolExecutionBoundary && boundaryFault) {
+			return;
+		}
 		record.started = true;
 		stream.push({
 			type: "tool_execution_start",
@@ -2634,97 +2654,98 @@ async function executeToolCalls(
 		let caughtError: unknown;
 		let completedToolExecution = false;
 		let executionStarted = false;
+		let returnedResult: AgentToolResult<any> | undefined;
+		let admission: ToolExecutionAdmission | undefined;
+		let haltedAfterAdmit = false;
 
-		await runInActiveSpan(toolSpan, async () => {
-			try {
-				if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
-				if (record.signal.aborted) {
-					result = createToolSignalAbortedResult(record.signal);
-					isError = true;
-					return;
-				}
-
-				if (record.prepareError !== undefined) throw record.prepareError;
-				if (record.blocked) {
-					throw new ToolCallBlockedError(record.blockReason);
-				}
-				const executionArgs = transformToolCallArguments
-					? transformToolCallArguments(effectiveArgs, toolCall.name)
-					: effectiveArgs;
-				record.args = executionArgs;
-
-				// The cooperative steering signal rides the loop-owned
-				// ToolCallContext (surfacing as `ctx.toolCall.steeringSignal`):
-				// AgentToolContext itself is app-built via declaration merging, so
-				// the loop cannot construct or extend one structurally.
-				const toolContext = getToolContext
-					? getToolContext({
-							batchId,
-							index,
-							total: toolCalls.length,
-							toolCalls: toolCallInfos,
-							steeringSignal: steeringSoftController.signal,
-							providerMetadata: toolCall.providerMetadata,
-						})
-					: undefined;
-				executionStarted = true;
-				const rawResult = await tool.execute(
-					toolCall.id,
-					executionArgs,
-					record.signal,
-					partialResult => {
-						stream.push({
-							type: "tool_execution_update",
-							toolCallId: toolCall.id,
-							toolName: toolCall.name,
-							args: executionArgs,
-							partialResult: coerceToolResult(partialResult).result,
-						});
-					},
-					toolContext,
-				);
-				completedToolExecution = true;
-				const coerced = coerceToolResult(rawResult);
-				result = coerced.result;
-				if (coerced.malformed || result.isError) isError = true;
-			} catch (e) {
-				caughtError = e;
-				result = {
-					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
-				};
-				isError = true;
-			}
-
-			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+		try {
+			await runInActiveSpan(toolSpan, async () => {
 				try {
-					const after = await afterToolCall(
-						{
-							assistantMessage,
-							toolCall,
-							args: record.args,
-							result,
-							isError,
-							context: currentContext,
-						},
-						record.signal,
-					);
-					if (after) {
-						// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
-						// code and may return malformed `content` (non-array / invalid blocks), which
-						// would otherwise be persisted verbatim and corrupt the session — the same
-						// hazard `coerceToolResult` guards on the execute path.
-						const coerced = coerceToolResult({
-							content: after.content ?? result.content,
-							details: after.details ?? result.details,
-							isError: after.isError ?? result.isError,
-							providerMetadata: after.providerMetadata ?? result.providerMetadata,
-							useless: after.useless ?? result.useless,
-						});
-						result = coerced.result;
-						isError = coerced.malformed || (after.isError ?? isError);
+					if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
+					if (record.signal.aborted) {
+						result = createToolSignalAbortedResult(record.signal);
+						isError = true;
+						return;
 					}
+
+					if (record.prepareError !== undefined) throw record.prepareError;
+					if (record.blocked) {
+						throw new ToolCallBlockedError(record.blockReason);
+					}
+					const executionArgs = transformToolCallArguments
+						? transformToolCallArguments(effectiveArgs, toolCall.name)
+						: effectiveArgs;
+					record.args = executionArgs;
+
+					// The cooperative steering signal rides the loop-owned
+					// ToolCallContext (surfacing as `ctx.toolCall.steeringSignal`):
+					// AgentToolContext itself is app-built via declaration merging, so
+					// the loop cannot construct or extend one structurally.
+					const toolContext = getToolContext
+						? getToolContext({
+								batchId,
+								index,
+								total: toolCalls.length,
+								toolCalls: toolCallInfos,
+								steeringSignal: steeringSoftController.signal,
+								providerMetadata: toolCall.providerMetadata,
+							})
+						: undefined;
+
+					const boundary = config.toolExecutionBoundary;
+					if (boundary) {
+						if (boundaryFault) throw boundaryFault;
+						try {
+							admission = await boundary.admit(
+								{
+									assistantMessage,
+									toolCall,
+									tool,
+									args: executionArgs,
+									context: currentContext,
+								},
+								record.signal,
+							);
+						} catch (e) {
+							throw toToolExecutionBoundaryError(e);
+						}
+						if (record.signal.aborted || (interruptState.triggered && record.interruptible)) {
+							result = record.signal.aborted
+								? createToolSignalAbortedResult(record.signal)
+								: createSkippedToolResult(interruptState.source, false);
+							isError = true;
+							return;
+						}
+						if (boundaryFault) {
+							haltedAfterAdmit = true;
+							isError = true;
+							return;
+						}
+					}
+
+					executionStarted = true;
+					const rawResult = await tool.execute(
+						toolCall.id,
+						executionArgs,
+						record.signal,
+						partialResult => {
+							stream.push({
+								type: "tool_execution_update",
+								toolCallId: toolCall.id,
+								toolName: toolCall.name,
+								args: executionArgs,
+								partialResult: coerceToolResult(partialResult).result,
+							});
+						},
+						toolContext,
+					);
+					completedToolExecution = true;
+					const coerced = coerceToolResult(rawResult);
+					result = coerced.result;
+					returnedResult = admission && afterToolCall ? structuredCloneJSON(result) : result;
+					if (coerced.malformed || result.isError) isError = true;
 				} catch (e) {
+					if (e instanceof ToolExecutionBoundaryError) throw e;
 					caughtError = e;
 					result = {
 						content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
@@ -2732,28 +2753,105 @@ async function executeToolCalls(
 					};
 					isError = true;
 				}
+				if (afterToolCall && !haltedAfterAdmit && (!record.signal.aborted || completedToolExecution)) {
+					try {
+						const after = await afterToolCall(
+							{
+								assistantMessage,
+								toolCall,
+								args: record.args,
+								result,
+								isError,
+								context: currentContext,
+							},
+							record.signal,
+						);
+						if (after) {
+							// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
+							// code and may return malformed `content` (non-array / invalid blocks), which
+							// would otherwise be persisted verbatim and corrupt the session — the same
+							// hazard `coerceToolResult` guards on the execute path.
+							const coerced = coerceToolResult({
+								content: after.content ?? result.content,
+								details: after.details ?? result.details,
+								isError: after.isError ?? result.isError,
+								providerMetadata: after.providerMetadata ?? result.providerMetadata,
+								useless: after.useless ?? result.useless,
+							});
+							result = coerced.result;
+							isError = coerced.malformed || (after.isError ?? isError);
+						}
+					} catch (e) {
+						if (e instanceof ToolExecutionBoundaryError) throw e;
+						caughtError = e;
+						result = {
+							content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
+							details: {},
+						};
+						isError = true;
+					}
+				}
+			});
+		} catch (e) {
+			if (e instanceof ToolExecutionBoundaryError) {
+				boundaryFault ??= e;
+				finishExecuteToolSpan(telemetry, toolSpan, {
+					result,
+					isError: true,
+					status: "error",
+					errorMessage: e.message,
+					errorObject: e,
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+				});
+				return;
 			}
-		});
+			throw e;
+		}
 
 		const interrupted = interruptState.triggered;
 		const perToolAborted = record.signal.aborted;
 		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
+		let emitResult = result;
+		let emitIsError = isError;
 		if (interrupted && abortedDuringExecution) {
 			// This tool's own signal fired AND it failed to produce a result. The
 			// execution may already have performed partial work before throwing on
 			// abort, so preserve that distinction in the placeholder metadata.
 			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
-		} else {
-			// No interrupt on this signal, or the tool finished before the interrupt landed
-			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
-			// its real result: a completed tool already ran its side effects, so the model must
-			// see what actually happened (a genuine non-zero exit / error result) rather than a
-			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
-			// on the batch leaves non-interruptible tools' signals untouched — their genuine
-			// errors survive here too.
-			emitToolResult(record, result, isError);
+			emitResult = createSkippedToolResult(interruptState.source, executionStarted);
+			emitIsError = true;
 		}
+
+		if (admission) {
+			const invocationOutcome = completedToolExecution ? "returned" : executionStarted ? "threw" : "not-started";
+			try {
+				await admission.settle({
+					result: emitResult,
+					isError: emitIsError,
+					executed: executionStarted,
+					outcome: invocationOutcome,
+					...(returnedResult !== undefined ? { returnedResult } : {}),
+				});
+			} catch (e) {
+				boundaryFault = toToolExecutionBoundaryError(e);
+			}
+		}
+
+		if (haltedAfterAdmit) {
+			finishExecuteToolSpan(telemetry, toolSpan, {
+				result,
+				isError: true,
+				status: "error",
+				errorMessage: boundaryFault?.message,
+				errorObject: boundaryFault,
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+			});
+			return;
+		}
+
+		emitToolResult(record, emitResult, emitIsError);
 
 		const firstTextBlock = result.content?.[0];
 		const errorMessageForSpan =
@@ -2876,19 +2974,21 @@ async function executeToolCalls(
 	// especially when tool results are large (e.g. bash output).
 	await yieldIfDue();
 
-	for (const record of records) {
-		if (!record.toolResultMessage) {
-			record.skipped = true;
-			recordSkippedTool(telemetry, {
-				toolCallId: record.toolCall.id,
-				toolName: record.toolCall.name,
-				status: "skipped",
-			});
-			emitToolResult(record, createSkippedToolResult(interruptState.source, false), true);
+	if (!boundaryFault) {
+		for (const record of records) {
+			if (!record.toolResultMessage) {
+				record.skipped = true;
+				recordSkippedTool(telemetry, {
+					toolCallId: record.toolCall.id,
+					toolName: record.toolCall.name,
+					status: "skipped",
+				});
+				emitToolResult(record, createSkippedToolResult(interruptState.source, false), true);
+			}
 		}
 	}
 
-	return { toolResults: emittedToolResults };
+	return { toolResults: emittedToolResults, boundaryFault };
 }
 
 /**

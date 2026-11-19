@@ -1,6 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
@@ -9,6 +9,7 @@ import type { Settings } from "../config/settings";
 import extractInputTemplate from "../prompts/memories/sharpshooter-extract-input.md" with { type: "text" };
 import extractSystemTemplate from "../prompts/memories/sharpshooter-extract-system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 import { customMessageContentText } from "../session/checkpoint-entries";
 import { appendSharpshooterDelta } from "./queue";
 import type { SharpshooterDelta, SharpshooterDeltaKind, SharpshooterDeltaSource, SharpshooterFriction } from "./types";
@@ -212,8 +213,9 @@ async function runSharpshooterExtraction(
 	if (!model || session.isDisposed) return;
 
 	const input = prompt.render(extractInputTemplate, { ...envelope });
+	const complete = completeImplFromEnrollment(session.inferenceStreamFn, session.continuationFactory !== undefined);
 	const response = await retryTransientCompletion(() =>
-		completeSimple(
+		complete(
 			model,
 			{
 				systemPrompt: [prompt.render(extractSystemTemplate)],

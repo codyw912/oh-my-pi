@@ -1,0 +1,4486 @@
+diff --git a/.omp/extensions/sjujperpowers.ts b/.omp/extensions/sjujperpowers.ts
+index 4b2d5b548f..51c3185c3b 100644
+--- a/.omp/extensions/sjujperpowers.ts
++++ b/.omp/extensions/sjujperpowers.ts
+@@ -2,6 +2,7 @@
+ import { dirname, join, resolve } from "node:path";
+ import { fileURLToPath } from "node:url";
+ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
++import { exportRecovery } from "../../skills/tracking-providers/scripts/export-recovery.mjs";
+ 
+ const extensionDir = dirname(fileURLToPath(import.meta.url));
+ const skillsDir = resolve(extensionDir, "../../skills");
+@@ -40,6 +41,13 @@
+ 			root !== undefined && !existsSync(join(root, ".jj")) ? JUJUTSU_SETUP_NOTICE : BACKEND_SETUP_NOTICE;
+ 	};
+ 
++	omp.registerContinuationWorkflow({
++		id: "sjujperpowers",
++		exportProjection: async ({ cwd, planPath }) => {
++			const root = findRepositoryRoot(cwd) ?? cwd;
++			return exportRecovery({ root, planPath, runtimeCheck: false });
++		},
++	});
+ 	omp.on("resources_discover", async () => ({
+ 		skillPaths: [skillsDir],
+ 	}));
+diff --git a/docs/testing.md b/docs/testing.md
+index e155a9150f..39c12a57ac 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -15,7 +15,8 @@
+ - `tests/codex/` — Codex marketplace manifest.
+ - `tests/claude-code/` — SDD tests plus `test-sdd-workspace.sh` (requires `jj`).
+ - `tests/starting-a-change/` — `fresh-change`, `trunk-rev`, `add-workspace`: spec/plan stay in the working copy, loose WIP is never absorbed, trunk resolves without config, workspaces descend from a committed ignore entry (requires `jj`).
+-- `tests/tracking-providers/` — provider normalization, checked Kata preflight, plan parsing, idempotent materialization, independent `file + kata` composition, and plan-root selection guards.
++- `tests/tracking-providers/` — provider normalization, checked Kata preflight, plan parsing, idempotent materialization, independent `file + kata` composition, plan-root selection guards, and recovery snapshot export/record/migrate contracts.
++
+ - `tests/systematic-debugging/` — find-polluter helper.
+ - `tests/writing-skills/` — skill graph rendering.
+ - `tests/shell-lint/` — shell lint.
+@@ -37,8 +38,10 @@
+ ```bash
+ node --test tests/tracking-providers/test-resolve-config.mjs
+ node --test tests/tracking-providers/test-materialize-plan.mjs
++node --test tests/tracking-providers/test-recovery.mjs
+ ```
+ 
++
+ Run both behavioral fixtures:
+ 
+ ```bash
+diff --git a/skills/executing-plans/SKILL.md b/skills/executing-plans/SKILL.md
+index d0ebdfcbfa..adb75d6c7b 100644
+--- a/skills/executing-plans/SKILL.md
++++ b/skills/executing-plans/SKILL.md
+@@ -18,11 +18,14 @@
+ ### Step 1: Load and Review Plan
+ 
+ 1. Read the plan file and approved spec before repository mutation.
++
+ 2. Use sjujperpowers:tracking-providers and retain the normalized provider selection plus materialized Kata parent/child refs.
+-3. With Kata, select the lowest-numbered open child in this plan's retained mapping. Start on a fresh change with sjujperpowers:starting-a-change and supply that exact ref; never use project-wide ready ordering for a named plan. Without Kata, start on a fresh change normally.
+-4. Review critically; identify any questions or concerns.
+-5. If concerns: raise them with your human partner before starting. For a claimed Kata child, add a substantive comment describing the blocker.
+-6. If no concerns: create harness-native todos for every plan task and proceed. Todos remain mandatory under every execution provider.
++3. Record and export recovery through the tracking-providers snapshot helpers (`record-recovery.mjs` / `export-recovery.mjs`) using workflow `inline`. Do not invent SDD review rounds. For `session`, persist the harness todo projection in the snapshot after every todo change; for `none`, record enough explicit facts (current task, phase, next action, task states) before a fresh handoff is eligible. Example after claiming task 1: `--event '{"workflow":"inline","current":{"task":1,"phase":"execute","round":null,"nextAction":"execute task 1"},"todos":[{"id":"t1","content":"Task 1","status":"in_progress"}]}'`. Record again when a task completes or a todo status changes. A failed record is an attention stop, not permission to continue.
++4. With Kata, select the current incomplete child from the exported projection. Start on a fresh change with sjujperpowers:starting-a-change and supply that exact ref; never use project-wide ready ordering for a named plan. Without Kata, start on a fresh change normally.
++5. Review critically; identify any questions or concerns.
++6. If concerns: raise them with your human partner before starting. For a claimed Kata child, add a substantive comment describing the blocker.
++7. If no concerns: create harness-native todos for every plan task, record them, and proceed. Todos remain mandatory under every execution provider.
++
+ 
+ ### Step 2: Execute Tasks
+ 
+@@ -33,7 +36,8 @@
+ 3. Follow every plan step and commit boundary exactly.
+ 4. Run the task's verification.
+ 5. With Kata, add a substantive comment naming the verified scope, exact test command, result, and Jujutsu change ID. Do not close: landing/publication has not happened.
+-6. Mark the harness todo completed and continue to the next task on the fresh `@` created by `jj commit`.
++6. Mark the harness todo completed, record the snapshot (`complete-task` or an updated `todos` array), and continue to the next task on the fresh `@` created by `jj commit`.
++
+ 
+ If a task blocks, keep its todo actionable, add the Kata `blocked` label with a substantive comment, and stop. On deliberate resume, reconcile the issue and todo first and remove `blocked` only after the blocker is resolved.
+ 
+diff --git a/skills/starting-a-change/SKILL.md b/skills/starting-a-change/SKILL.md
+index be1a4240e3..81589897c8 100644
+--- a/skills/starting-a-change/SKILL.md
++++ b/skills/starting-a-change/SKILL.md
+@@ -26,7 +26,8 @@
+ For `kata`:
+ 
+ 1. Read the configured project from normalized output.
+-2. If the user or caller supplied a child issue ref, validate with `kata --project <project> --json show <ref>` that it is open and labeled `sjujperpowers-task`; reject `sjujperpowers-plan` roots. A named-plan caller MUST first recover its mapping with tracking-providers, reconcile completed task numbers from its recovery ledger, and supply the lowest-numbered incomplete child; if it did not, stop rather than infer from open state. Only when neither a plan nor issue ref was supplied, run `kata --project <project> --json next --label sjujperpowers-task` and use `issue.short_id`; `issue: null` means stop with no ready task work.
++2. If the user or caller supplied a child issue ref, validate with `kata --project <project> --json show <ref>` that it is open and labeled `sjujperpowers-task`; reject `sjujperpowers-plan` roots. A named-plan caller MUST first recover its mapping with tracking-providers `export-recovery.mjs`, reconcile completed and complete-but-unlanded tasks from that projection, and supply the current incomplete child; if it did not, stop rather than infer from open state. Only when neither a plan nor issue ref was supplied, run `kata --project <project> --json next --label sjujperpowers-task` and use `issue.short_id`; `issue: null` means stop with no ready task work.
++
+ 3. Build the qualified ref as `<project>#<short_id>`.
+ 4. Claim without force:
+ 
+diff --git a/skills/subagent-driven-development/SKILL.md b/skills/subagent-driven-development/SKILL.md
+index 72e8bda79c..68155a3ae0 100644
+--- a/skills/subagent-driven-development/SKILL.md
++++ b/skills/subagent-driven-development/SKILL.md
+@@ -123,36 +123,50 @@
+ 
+ ## Setup
+ 
+-Before repository mutation, read the named plan and approved spec, use sjujperpowers:tracking-providers, and obtain the plan's materialized child mapping. If a recovery ledger already exists, reconcile it first and select the lowest-numbered open child without `Task <N>: complete`; otherwise select Task 1. Start on a fresh change with sjujperpowers:starting-a-change and supply that exact ref. Never use project-wide ready ordering for a named plan. The starting skill runs checked preflight again, claims/associates the child, and then reuses an empty `@`, stacks on described work, or steps beside loose WIP. Never build inside a change that already holds someone else's undescribed work.
++Before repository mutation, read the named plan and approved spec, use sjujperpowers:tracking-providers, and obtain the plan's materialized child mapping. Export the recovery projection with `node <tracking-providers>/scripts/export-recovery.mjs --root "$(jj root)" --plan <plan>` — it is read-only and must not create issues, claim work, pick another plan, or consult project-wide ready ordering. If a snapshot already exists, resume at `current.nextAction`; otherwise start Task 1. Start on a fresh change with sjujperpowers:starting-a-change and supply that exact ref. Never use project-wide ready ordering for a named plan. The starting skill runs checked preflight again, claims/associates the child, and then reuses an empty `@`, stacks on described work, or steps beside loose WIP. Never build inside a change that already holds someone else's undescribed work.
+ 
+ Conversation memory does not survive compaction. In real sessions,
+ controllers that lost their place have re-dispatched entire completed task
+ sequences — the single most expensive failure observed. Track progress in
+-a ledger file, not only in todos.
++the per-plan snapshot, not only in todos.
+ 
+ - Each plan owns a workspace: at skill start, run this skill's
+   `scripts/sdd-workspace PLAN_FILE` — it prints the plan's ignored
+-  directory (`<repo-root>/.sjujperpowers/sdd/<plan-basename>/`), home to
+-  every artifact for THIS plan: ledger, briefs, reports, review packages.
+-  Another plan's directory is never yours to read or write.
+-- Check for this plan's ledger at `<workspace>/progress.md`. If its first
+-  line names your plan file, tasks with a `Task <N>: complete` line are DONE
+-  — do not re-dispatch them; resume at the first task without one. A task
+-  whose last line is a fix round is mid-loop: resume the loop at the next
+-  round. A ledger whose first line names a different plan file — or a stray
+-  ledger at the old flat path `.sjujperpowers/sdd/progress.md` — is another
+-  plan's progress: leave it in place and start your own, fresh.
+-- Create the ledger with its identity as the first line:
+-  `# SDD ledger — plan: <plan file path>`.
+-- Use sjujperpowers:tracking-providers and retain the normalized provider selection. For Kata, record the materialized parent ref and each `Task <N>: Kata <qualified-ref>` in this recovery ledger. These are recovery pointers, not a second lifecycle ledger.
+-- On resume, reconcile the ledger with `kata show` before dispatch. A closed child without `Task <N>: complete` or with an unfinished review round is a contradiction: stop and resolve it. A complete ledger task with an open Kata child is expected before landing. A claim owned by another actor is a conflict; never force it.
+-- The ledger is your recovery map: the change IDs it names survive rebase,
+-  squash, and describe even when your context no longer remembers creating
+-  them. After compaction, trust the ledger and `jj log` over your own
+-  recollection.
++  directory (`<repo-root>/.sjujperpowers/sdd/<plan-key>/`), where
++  `<plan-key>` is the SHA-256 of the canonical repository-relative plan
++  path. That directory is home to THIS plan's snapshot, briefs, reports,
++  and review packages. Another plan's directory is never yours to read or
++  write, including a different plan that shares the same basename.
++- The authoritative recovery record is `<workspace>/progress.md`: a
++  versioned machine-readable snapshot plus human-readable progress
++  rendered from that same snapshot. Do not keep a second workflow event
++  journal. Record through
++  `node <tracking-providers>/scripts/record-recovery.mjs --root "$(jj root)" --plan <plan> --event '<json>'`
++  so evidence is persisted before the snapshot is acknowledged.
++- A basename directory such as `.sjujperpowers/sdd/<plan-basename>/` or a
++  stray `.sjujperpowers/sdd/progress.md` is legacy evidence. Leave it in
++  place. Convert it only with
++  `node <tracking-providers>/scripts/migrate-recovery.mjs --root "$(jj root)" --plan <plan> --enroll`.
++  Without `--enroll`, do not migrate. Ambiguous or missing evidence stops
++  conversion; never guess completion.
++- Use sjujperpowers:tracking-providers and retain the normalized provider
++  selection. For Kata, record qualified child refs and observed revisions
++  in the snapshot as provider references, not replacement claim authority.
++- On resume, export the projection and reconcile every referenced child
++  with `kata --json show`, including closed children. A closed child with
++  unfinished review is a contradiction: stop. A complete snapshot task
++  with an open Kata child is complete-but-unlanded and must not be
++  redispatched. A claim owned by another actor is a conflict; never force it.
++- Global constraints come from the plan (and therefore the export), not
++  from the task brief. If a brief file is missing, regenerate it in memory
++  from the matching plan; do not read another plan's workspace.
++- The snapshot is your recovery map: the change IDs and evidence revisions
++  it names survive rebase, squash, and describe. After compaction, trust
++  the snapshot and `jj log` over your own recollection.
+ - The workspace is ignored scratch, so `jj restore` / `jj abandon` cannot
+   delete it. If it is removed from disk, recover from `jj log`.
+ 
++
+ Read the plan once, note its context and Global Constraints, and create a
+ todo per task. If the plan names a Spec, read that too: the spec is the
+ authority the plan argues from, and conflicts inside the plan resolve
+@@ -426,8 +440,11 @@
+ findings list. Out-of-scope observations go to the ledger as deferred
+ minors — they never extend the loop.
+ 
+-**After each round,** append to the ledger:
+-`Task <N>: fix round <R>/5 (<X> addressed, <Y> open — <finding one-liners>; changes <a>..<b>)`
++**After each round,** record the snapshot with `record-recovery.mjs`
++(type `fix-round`, exact round, open findings, rejected approaches, and
++immutable evidence revisions). The rendered `progress.md` must show
++`Task <N> · fix · round <R>/5` from that snapshot — do not append a
++competing prose journal.
+ 
+ Never fix findings yourself in the controller session — your context stays
+ clean for coordination, and controller fixes skip review.
+@@ -455,12 +472,11 @@
+ ### 5. Complete the task
+ 
+ When the review comes back clean — or every open finding is parked with a
+-ruling at the cap — append the completion line to the ledger in the same
+-message as your other bookkeeping:
++ruling at the cap — record completion through `record-recovery.mjs`
++(type `complete-task`, commits, parked findings) in the same message as
++your other bookkeeping. The snapshot, not a free-form `Task <N>: complete`
++line, is the authority.
+ 
+-- `Task <N>: complete (changes <base>..<head>, review clean)`
+-- `Task <N>: complete (changes <base>..<head>, <K> parked)` after a
+-  tripped breaker
+ 
+ Then mark the todo complete and move on. Never move to the next task while
+ the review has open Critical/Important issues that are neither fixed nor
+@@ -531,7 +547,8 @@
+ 
+ [Setup: isolated change verified]
+ [Read plan file once: docs/project/plans/feature-plan.md]
+-[Resolve workspace: scripts/sdd-workspace docs/project/plans/feature-plan.md — no ledger inside, fresh start]
++[Resolve workspace: scripts/sdd-workspace docs/project/plans/feature-plan.md — no snapshot inside, fresh start]
++
+ [Create todos for all tasks]
+ 
+ Task 1: Hook installation script
+@@ -552,7 +569,7 @@
+ Task reviewer: Spec ✅ - all requirements met, nothing extra.
+   Strengths: Good test coverage, clean. Issues: None. Task quality: Approved.
+ 
+-[Ledger: Task 1: complete (changes a1b2c3d..d4e5f6a, review clean)]
++[Record snapshot: Task 1 complete]
+ 
+ Task 2: Recovery modes
+ 
+@@ -577,8 +594,9 @@
+   Magic number — ADDRESSED (src/recovery.js:7). New breakage: none.
+   Verdict: all findings addressed.
+ 
+-[Ledger: Task 2: fix round 1/5 (2 addressed, 0 open; changes d4e5f6a..b7c8d9e)]
+-[Ledger: Task 2: complete (changes d4e5f6a..b7c8d9e, review clean)]
++[Record snapshot: Task 2 fix round 1/5]
++[Record snapshot: Task 2 complete]
++
+ 
+ ...
+ 
+diff --git a/skills/subagent-driven-development/scripts/review-package b/skills/subagent-driven-development/scripts/review-package
+index a151a731d4..3f3f02f0e0 100755
+--- a/skills/subagent-driven-development/scripts/review-package
++++ b/skills/subagent-driven-development/scripts/review-package
+@@ -7,8 +7,9 @@
+ # BASE is the commit ID recorded before dispatch (immutable: jj resolves it
+ # even after the change was rewritten or hidden, so amended fix rounds still
+ # diff correctly). HEAD is normally `@`. Any single-commit revset works.
+-# Default OUTFILE: <repo-root>/.sjujperpowers/sdd/<plan-basename>/review-<base12>..<head12>.diff
+-# (named per range, so a re-review after fixes gets a distinct fresh file).
++# Default OUTFILE: <repo-root>/.sjujperpowers/sdd/<plan-key>/review-<base12>..<head12>.diff
++# (plan-key is SHA-256 of the canonical repository-relative plan path).
++
+ set -euo pipefail
+ 
+ if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+diff --git a/skills/subagent-driven-development/scripts/sdd-workspace b/skills/subagent-driven-development/scripts/sdd-workspace
+index 3f8e11d0ce..03d2141af8 100755
+--- a/skills/subagent-driven-development/scripts/sdd-workspace
++++ b/skills/subagent-driven-development/scripts/sdd-workspace
+@@ -1,12 +1,12 @@
+ #!/usr/bin/env bash
+ # Resolve and ensure the working-tree directory SDD uses for one plan's
+ # short-lived artifacts: task briefs, implementer reports, review packages,
+-# and the progress ledger. Print the plan directory's absolute path.
++# and the progress snapshot. Print the plan directory's absolute path.
+ #
+-# One directory per plan (.sjujperpowers/sdd/<plan-basename>/) so a follow-up
+-# plan in the same working tree can never read or overwrite another plan's
+-# artifacts. A stale ledger misread as current progress makes controllers
+-# skip whole task sequences — plan-scoping removes that failure structurally.
++# One directory per plan (.sjujperpowers/sdd/<plan-key>/) keyed by the SHA-256
++# of the canonical repository-relative plan path, not the basename. Two plans
++# that share a filename therefore cannot read or overwrite each other.
++# Legacy basename directories are left in place as retained evidence.
+ #
+ # jj auto-tracks every new file. A self-ignoring .gitignore at
+ # .sjujperpowers/sdd/ keeps every plan's workspace out of snapshots without
+@@ -27,16 +27,14 @@
+ plan=$1
+ [ -f "$plan" ] || { echo "no such plan file: $plan" >&2; exit 2; }
+ 
+-slug=$(basename "$plan" .md)
+-[ -n "$slug" ] && [ "$slug" != "." ] && [ "$slug" != ".." ] \
+-  || { echo "cannot derive a workspace name from: $plan" >&2; exit 2; }
+-
+ if ! root=$(jj root 2>/dev/null); then
+   echo "This isn't a jj repo. Run \`jj git init --colocate\` and re-run, or tell me to continue without VCS steps." >&2
+   exit 2
+ fi
++
++scripts="$(cd "$(dirname "$0")/../../tracking-providers/scripts" && pwd)"
++dir=$(node "$scripts/recovery-lib.mjs" --workspace-path --root "$root" --plan "$plan") || exit 2
+ base="$root/.sjujperpowers/sdd"
+-dir="$base/$slug"
+ mkdir -p "$dir"
+ printf '*\n' > "$base/.gitignore"
+ cd "$dir" && pwd
+diff --git a/skills/subagent-driven-development/scripts/task-brief b/skills/subagent-driven-development/scripts/task-brief
+index 9d720a5c8d..2208a0b4ce 100755
+--- a/skills/subagent-driven-development/scripts/task-brief
++++ b/skills/subagent-driven-development/scripts/task-brief
+@@ -4,9 +4,9 @@
+ # through the controller's context.
+ #
+ # Usage: task-brief PLAN_FILE TASK_NUMBER [OUTFILE]
+-# Default OUTFILE: <repo-root>/.sjujperpowers/sdd/<plan-basename>/task-<N>-brief.md
+-# (per plan and per worktree; concurrent runs of the SAME plan in the same
+-# working tree share it).
++# Default OUTFILE: <repo-root>/.sjujperpowers/sdd/<plan-key>/task-<N>-brief.md
++# (plan-key is SHA-256 of the canonical repository-relative plan path).
++
+ set -euo pipefail
+ 
+ if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+diff --git a/skills/tracking-providers/SKILL.md b/skills/tracking-providers/SKILL.md
+index a9e99dcc67..3de5cbf37a 100644
+--- a/skills/tracking-providers/SKILL.md
++++ b/skills/tracking-providers/SKILL.md
+@@ -135,16 +135,74 @@
+ 
+ Stable idempotency keys derive from the Kata project and repository-relative plan path, so retry the same command after a partial failure; do not create replacement issues manually. The parent and children record `sjujperpowers.plan`, `sjujperpowers.spec`, and `sjujperpowers.source` metadata. Children additionally record `sjujperpowers.task`. The source is provider-neutral, so `file + kata`, `plane + kata`, and bootstrap sources materialize identically.
+ 
+-Recover a named plan's mapping in a fresh session with:
+-
+-```bash
+-kata --project <project> --json list \
+-  --status open \
+-  --label sjujperpowers-task \
+-  --meta "sjujperpowers.plan=<repository-relative-plan-path>"
+-```
+-
+-Sort the returned issues numerically by `metadata["sjujperpowers.task"]`. Reconcile that list with the execution or SDD recovery ledger and supply the lowest-numbered child not marked complete to starting-a-change. Open completed children intentionally remain open until the configured landing or publication milestone, so open-state alone cannot identify the next task. Project-wide `kata next` is only for work without a named plan.
++Recover a named plan from its enrolled snapshot:
++
++```bash
++node <tracking-providers skill dir>/scripts/export-recovery.mjs \
++  --root "$(jj root)" \
++  --plan <repository-relative-plan-path>
++```
++
++Export is read-only: it must not create issues, claim work, select a
++different plan, or run project-wide `kata next` / open-only lists.
++Reconcile every referenced child with `kata --json show`, including closed
++children. A complete snapshot task with an open child is complete-but-unlanded.
++A closed child with unfinished review is a contradiction and blocks. Supply
++the current task's child to starting-a-change. Project-wide `kata next` is
++only for work without a named plan. Failed, unknown, or missing Kata
++revisions/status/plan/task metadata make recovery ineligible; never invent
++the current observation from an older snapshot revision.
++
++## Recovery snapshot recording
++
++`progress.md` is one versioned current snapshot plus human-readable progress
++rendered from that snapshot. It is not a second event journal. Record through
++`record-recovery.mjs` so evidence is retained and fsynced before
++acknowledgment. The receipt is `{acknowledged, revision, eventId,
++snapshotEvidence, retained, evidence, progressPath}`. Reconcile a lost ack
++by reading `eventId` (`sjujperpowers:record:<plan-key>:r<revision>`) and the
++published `snapshotEvidence`.
++
++Initialize (workflow `sdd` or `inline`; `session` must persist todos):
++
++```bash
++node <tracking-providers skill dir>/scripts/record-recovery.mjs \
++  --root "$(jj root)" \
++  --plan docs/project/plans/feature.md \
++  --event '{"workflow":"sdd","expectedRevision":1,"current":{"task":1,"phase":"implement","round":null,"nextAction":"implement task 1"},"todos":[{"id":"t1","content":"Task 1","status":"in_progress"}]}'
++```
++
++Finding, ruling, fix round, completion, and inline todos:
++
++```json
++{"type":"finding","finding":{"id":"f1","task":2,"status":"open","summary":"missing progress reporting","evidence":[]},"current":{"task":2,"phase":"fix","round":1,"nextAction":"resume fix round 1"}}
++{"type":"decision","decision":{"id":"d1","task":2,"summary":"keep the helper","rationale":"spec requires it","costIfWrong":"rework the helper","sourceText":"Ruling: keep the helper — spec requires it — rework the helper","evidence":[]}}
++{"type":"fix-round","task":2,"round":1,"expectedRevision":3,"findings":[{"id":"f1","task":2,"status":"open","summary":"missing progress reporting","evidence":[]}],"rejectedApproaches":[{"id":"r1","task":2,"summary":"rewrite from scratch","reason":"loses the reviewed interface","evidence":[]}]}
++{"type":"complete-task","task":2,"expectedRevision":4,"changes":{"base":"<commit>","head":"<commit>"}}
++{"workflow":"inline","todos":[{"id":"t2","content":"Task 2","status":"in_progress"}],"current":{"task":2,"phase":"execute","round":null,"nextAction":"execute task 2"}}
++```
++
++Failure/recovery rules:
++
++- Validate the event, expected revision, and plan digest before any
++  destructive write. Exact `evidenceRefs` must already verify; same-length
++  mutated bytes are rejected.
++- Copy referenced bytes into `retained/` before replacing the current
++  snapshot. Do not hardlink. Do not keep checkpoints on mutable report paths.
++- Kata enrollment requires a mapping for every plan task, live `issue.revision`
++  (integer), `issue.status`, `sjujperpowers.plan` / `sjujperpowers.task`
++  metadata, `sjujperpowers-task` labels, and lease/owner identity from show.
++  Record/migrate refuse to acknowledge if reconciliation fails.
++- Convert a basename ledger only with `migrate-recovery.mjs --enroll`.
++  Ambiguous lines, missing review reports, or failed Kata show stop
++  conversion. The original bytes are copied into retained evidence.
++- A completed SDD task with open findings or unfinished review is a
++  contradiction. Review, landing, and escalation rules are unchanged:
++  fix rounds 1-3 resume the implementer, 4-5 take fresh eyes, landing still
++  happens in finishing-a-change-stack, and Kata children stay open until
++  that completion event.
++
++
+ 
+ ## Plane shared backlog
+ 
+diff --git a/skills/tracking-providers/scripts/export-recovery.mjs b/skills/tracking-providers/scripts/export-recovery.mjs
+new file mode 100755
+index 0000000000..6d36796447
+--- /dev/null
++++ b/skills/tracking-providers/scripts/export-recovery.mjs
+@@ -0,0 +1,499 @@
++#!/usr/bin/env node
++
++import { execFile as execFileCallback } from 'node:child_process';
++import { realpathSync } from 'node:fs';
++import { join, resolve } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { promisify } from 'node:util';
++
++import {
++  extractGlobalConstraints,
++  extractTaskBody,
++  parsePlan,
++} from './materialize-plan.mjs';
++import { resolveConfig } from './resolve-config.mjs';
++import {
++  RecoveryError,
++  collectSnapshotEvidence,
++  defaultPhase,
++  digestBytes,
++  normalizeSnapshot,
++  readProgress,
++  reconcileKata,
++  resolvePlanIdentity,
++  sufficientNoneFacts,
++  verifyFileEvidence,
++} from './recovery-lib.mjs';
++
++
++const execFile = promisify(execFileCallback);
++
++class CliUsageError extends Error {}
++
++function regeneratedBrief(task, text) {
++  const bytes = Buffer.from(text, 'utf8');
++  const digest = digestBytes(bytes);
++  return {
++    kind: 'regenerated',
++    task,
++    text,
++    byteLength: digest.byteLength,
++    sha256: digest.sha256,
++  };
++}
++
++async function defaultShowIssue({ root, project, ref }) {
++  const { stdout } = await execFile(
++    'kata',
++    ['--project', project, '--json', 'show', ref],
++    {
++      cwd: root,
++      encoding: 'utf8',
++      maxBuffer: 1024 * 1024,
++    },
++  );
++  try {
++    return JSON.parse(stdout);
++  } catch (error) {
++    throw new RecoveryError(`Kata show returned invalid JSON: ${error.message}`, {
++      status: 'attention',
++      blockers: [`kata-show-json:${ref}`],
++    });
++  }
++}
++
++function recoveryResult(status, blockers, capabilities) {
++  return {
++    eligible: status === 'eligible',
++    status,
++    blockers,
++    capabilities,
++  };
++}
++
++function capabilitiesFor(workflow, executionProvider) {
++  const capabilities = ['brief-regeneration', 'constraint-export'];
++  if (workflow === 'sdd') capabilities.push('sdd-review');
++  if (workflow === 'inline') capabilities.push('inline-execution');
++  if (executionProvider === 'session') capabilities.push('session-todos');
++  if (executionProvider === 'kata') capabilities.push('kata-claims');
++  return capabilities;
++}
++
++function evidenceKey(ref) {
++  return `${ref.path}\0${ref.byteLength}\0${ref.sha256}`;
++}
++
++function isMissingFileError(error) {
++  return error?.code === 'ENOENT';
++}
++
++function hasActiveReview(snapshot, task) {
++  return task.state === 'review'
++    || task.state === 'fix'
++    || snapshot.findings.some((finding) => finding.task === task.number && finding.status === 'open');
++}
++
++function attachBriefs(identity, tasks, { sourceMatches = true } = {}) {
++  if (!sourceMatches) return tasks;
++  return tasks.map((task) => {
++    if (task.brief) return task;
++    return {
++      ...task,
++      brief: regeneratedBrief(task.number, extractTaskBody(identity.markdown, task.number)),
++    };
++  });
++}
++
++function currentFromTasks(snapshot, tasks) {
++  const contradictory = tasks.find((task) => task.state === 'contradictory');
++  if (contradictory) {
++    return {
++      task: contradictory.number,
++      phase: contradictory.phase,
++      round: contradictory.round,
++      nextAction: `resolve contradictory child state for task ${contradictory.number}`,
++    };
++  }
++  const active = tasks.find((task) =>
++    task.state === 'in_progress'
++    || task.state === 'review'
++    || task.state === 'fix'
++    || task.state === 'blocked',
++  );
++  if (active) {
++    return {
++      task: active.number,
++      phase: active.phase,
++      round: active.round,
++      nextAction: active.nextAction ?? snapshot.current.nextAction,
++    };
++  }
++  const pending = tasks.find((task) => task.state === 'pending');
++  if (pending) {
++    return {
++      task: pending.number,
++      phase: pending.phase,
++      round: pending.round,
++      nextAction: pending.nextAction ?? snapshot.current.nextAction,
++    };
++  }
++  const unlanded = tasks.find((task) => task.state === 'complete_unlanded');
++  if (unlanded) {
++    return {
++      task: unlanded.number,
++      phase: 'complete',
++      round: null,
++      nextAction: snapshot.current.nextAction,
++    };
++  }
++  return {
++    task: snapshot.current.task,
++    phase: snapshot.current.phase,
++    round: snapshot.current.round,
++    nextAction: snapshot.current.nextAction,
++  };
++}
++
++function baseProjection({
++  identity,
++  parsedPlan,
++  workflow,
++  execution,
++  constraints,
++  recovery,
++  revision = 0,
++  current,
++  tasks,
++  findings = [],
++  decisions = [],
++  rejectedApproaches = [],
++  evidence = [],
++  claims = [],
++  todos = null,
++}) {
++  const selectedWorkflow = workflow ?? 'sdd';
++  const phase = current?.phase ?? 'unenrolled';
++  return {
++    version: 1,
++    plan: {
++      root: identity.root,
++      relativePath: identity.relativePath,
++      sha256: identity.sha256,
++    },
++    workflow: selectedWorkflow,
++    execution,
++    revision,
++    constraints,
++    current: current ?? {
++      task: parsedPlan.tasks[0]?.number ?? null,
++      phase,
++      round: null,
++      nextAction: recovery.blockers.includes('not-enrolled')
++        ? 'record an explicit recovery snapshot before fresh handoff'
++        : 'stop; recovery is not eligible',
++    },
++    tasks: tasks ?? parsedPlan.tasks.map((task) => ({
++      number: task.number,
++      title: task.title,
++      state: 'pending',
++      phase: phase === 'unenrolled' ? defaultPhase(selectedWorkflow) : phase,
++      round: null,
++      nextAction: null,
++      brief: regeneratedBrief(task.number, extractTaskBody(identity.markdown, task.number)),
++      report: null,
++      reviewPackage: null,
++      claim: null,
++      commits: { base: null, head: null },
++    })),
++    findings,
++    decisions,
++    rejectedApproaches,
++    evidence,
++    claims,
++    todos,
++    recovery,
++  };
++}
++
++function liveClaim(claim, status) {
++  if (!claim) return null;
++  return {
++    kind: 'provider',
++    provider: 'kata',
++    ref: claim.ref,
++    uid: claim.uid ?? null,
++    project: claim.project ?? null,
++    shortId: claim.shortId ?? null,
++    observedRevision: status === 'unknown' ? null : claim.observedRevision,
++    status,
++    task: claim.task ?? null,
++    labels: status === 'unknown' ? [] : claim.labels ?? [],
++    owner: status === 'unknown' ? null : claim.owner ?? null,
++    lease: status === 'unknown' ? null : claim.lease ?? null,
++    claimOwner: status === 'unknown' ? null : claim.owner ?? claim.lease?.holder ?? null,
++  };
++}
++
++export async function exportRecovery({
++  root,
++  planPath,
++  workflow,
++  showIssue,
++  config,
++  runtimeCheck = false,
++} = {}) {
++  const identity = await resolvePlanIdentity(root, planPath);
++  const parsedPlan = parsePlan(identity.markdown);
++  const constraints = extractGlobalConstraints(identity.markdown);
++  const resolvedConfig = config ?? await resolveConfig(identity.root, { runtimeCheck });
++  const execution = {
++    provider: resolvedConfig.execution.provider,
++    ...(resolvedConfig.execution.provider === 'kata'
++      ? { project: resolvedConfig.execution.project }
++      : {}),
++    completion: resolvedConfig.execution.completion,
++  };
++  const progress = await readProgress(identity);
++  const selectedWorkflow = workflow ?? (progress.kind === 'snapshot' ? progress.raw?.workflow : 'sdd');
++  const capabilities = capabilitiesFor(selectedWorkflow, execution.provider);
++
++  if (progress.kind === 'legacy') {
++    return baseProjection({
++      identity,
++      parsedPlan,
++      workflow: selectedWorkflow,
++      execution,
++      constraints,
++      recovery: recoveryResult('attention', [
++        'legacy-ledger-unenrolled',
++        `legacy-path:${identity.progressPath}`,
++      ], capabilities),
++    });
++  }
++  if (progress.kind === 'unknown') {
++    return baseProjection({
++      identity,
++      parsedPlan,
++      workflow: selectedWorkflow,
++      execution,
++      constraints,
++      current: {
++        task: null,
++        phase: 'unsupported',
++        round: null,
++        nextAction: 'stop; recovery format is unsupported',
++      },
++      recovery: recoveryResult('unsupported', ['unsupported-progress-format'], capabilities),
++    });
++  }
++  if (progress.kind === 'missing') {
++    return baseProjection({
++      identity,
++      parsedPlan,
++      workflow: selectedWorkflow,
++      execution,
++      constraints,
++      recovery: recoveryResult('ineligible', ['not-enrolled'], capabilities),
++    });
++  }
++
++  const snapshot = normalizeSnapshot(progress.raw, identity, parsedPlan);
++  const evidenceBlockers = [];
++  const publishedBytes = Buffer.from(progress.markdown, 'utf8');
++  const publishedDigest = digestBytes(publishedBytes);
++  const publication = {
++    kind: 'file',
++    path: join(identity.retainedDir, `${publishedDigest.sha256}-snapshot-r${snapshot.revision}.md`),
++    ...publishedDigest,
++  };
++  let publicationVerified = false;
++  try {
++    await verifyFileEvidence(publication);
++    publicationVerified = true;
++  } catch {
++    evidenceBlockers.push(`unacknowledged-snapshot:${snapshot.revision}`);
++  }
++  const skipGeneric = new Set();
++  const missingBriefs = new Set();
++  const missingReview = new Set();
++  for (const task of snapshot.tasks) {
++    if (task.brief) {
++      try {
++        await verifyFileEvidence(task.brief);
++      } catch (error) {
++        skipGeneric.add(evidenceKey(task.brief));
++        if (isMissingFileError(error)) missingBriefs.add(task.number);
++        else evidenceBlockers.push(error.blockers?.[0] ?? error.message);
++      }
++    }
++    for (const field of ['report', 'reviewPackage']) {
++      const ref = task[field];
++      if (!ref) continue;
++      try {
++        await verifyFileEvidence(ref);
++      } catch (error) {
++        skipGeneric.add(evidenceKey(ref));
++        if (isMissingFileError(error) && hasActiveReview(snapshot, task)) {
++          missingReview.add(task.number);
++        } else {
++          evidenceBlockers.push(error.blockers?.[0] ?? error.message);
++        }
++      }
++    }
++  }
++  for (const number of missingReview) {
++    evidenceBlockers.push(`missing-review-evidence:task-${number}`);
++  }
++  const knowledgeEvidence = new Set([
++    ...snapshot.findings.flatMap((finding) => finding.evidence),
++    ...snapshot.decisions.flatMap((decision) => decision.evidence),
++    ...snapshot.rejectedApproaches.flatMap((rejected) => rejected.evidence),
++  ].map(evidenceKey));
++  for (const evidence of collectSnapshotEvidence(snapshot)) {
++    if (skipGeneric.has(evidenceKey(evidence)) && !knowledgeEvidence.has(evidenceKey(evidence))) continue;
++    try {
++      await verifyFileEvidence(evidence);
++    } catch (error) {
++      evidenceBlockers.push(error.blockers?.[0] ?? error.message);
++    }
++  }
++
++  const overlay = await reconcileKata({
++    snapshot,
++    identity,
++    execution,
++    showIssue: execution.provider === 'kata' ? (showIssue ?? defaultShowIssue) : undefined,
++    root: identity.root,
++    overlayStates: true,
++  });
++
++  const sourceMatches = snapshot.plan.sha256 === identity.sha256;
++  const tasks = attachBriefs(
++    identity,
++    overlay.tasks.map((task) => (
++      missingBriefs.has(task.number) ? { ...task, brief: null } : task
++    )),
++    { sourceMatches },
++  );
++  const current = currentFromTasks(snapshot, tasks);
++  const blockers = [...evidenceBlockers, ...overlay.blockers];
++  if (snapshot.plan.sha256 !== identity.sha256) {
++    blockers.push(`plan-digest-changed:${snapshot.plan.sha256}:${identity.sha256}`);
++  }
++  if (workflow !== undefined && workflow !== snapshot.workflow) blockers.push('workflow-mismatch');
++  if (snapshot.execution.provider !== execution.provider) blockers.push('execution-provider-mismatch');
++  if (snapshot.execution.completion !== execution.completion) blockers.push('execution-completion-mismatch');
++  if (execution.provider !== 'kata' && (snapshot.claims.length > 0 || tasks.some((task) => task.claim))) {
++    blockers.push('provider-claims-without-kata-authority');
++  }
++
++  const claims = overlay.claims.map((claim) => liveClaim(claim, claim.status ?? 'unknown'));
++
++  const contradictory = tasks.some((task) => task.state === 'contradictory')
++    || blockers.some((item) => item.startsWith('closed-child-unfinished-review:'))
++    || blockers.includes('workflow-mismatch')
++    || blockers.includes('execution-provider-mismatch')
++    || blockers.includes('execution-completion-mismatch')
++    || blockers.includes('execution-project-mismatch');
++  const observationFailed = blockers.some((item) =>
++    item.startsWith('kata-show-failed:')
++    || item.startsWith('kata-status-unknown:')
++    || item.startsWith('kata-revision-missing:')
++    || item.startsWith('kata-show-missing-issue:')
++    || item.startsWith('missing-task-mapping:')
++    || item.startsWith('kata-plan-metadata-mismatch:')
++    || item.startsWith('kata-task-metadata-mismatch:')
++    || item.startsWith('kata-label-missing:')
++    || item.startsWith('kata-ref-project-mismatch:')
++    || item.startsWith('kata-short-id-mismatch:')
++    || item.startsWith('kata-owner-changed:')
++    || item.startsWith('kata-lease-released:')
++    || item.startsWith('kata-lease-expired:')
++    || item.startsWith('kata-lease-foreign:')
++    || item.startsWith('kata-lease-replaced:')
++    || item === 'missing-kata-show',
++  );
++
++  let status = 'eligible';
++  if (contradictory) status = 'contradictory';
++  else if (observationFailed || evidenceBlockers.length > 0) status = 'attention';
++  else if (snapshot.plan.sha256 !== identity.sha256) status = 'attention';
++  else if (execution.provider === 'session' && (!snapshot.todos || snapshot.todos.length === 0)) {
++    status = 'ineligible';
++    blockers.push('session-todos-missing');
++  } else if (execution.provider === 'none' && !sufficientNoneFacts(snapshot)) {
++    status = 'ineligible';
++    blockers.push('none-recovery-facts-missing');
++  }
++
++  if (status === 'eligible') capabilities.push('fresh-handoff');
++
++  return {
++    version: 1,
++    plan: {
++      root: identity.root,
++      relativePath: identity.relativePath,
++      sha256: identity.sha256,
++    },
++    workflow: snapshot.workflow,
++    execution,
++    revision: snapshot.revision,
++    constraints,
++    current,
++    tasks: tasks.map((task) => ({
++      ...task,
++      claim: liveClaim(task.claim, task.claim?.status ?? 'unknown'),
++    })),
++    findings: snapshot.findings,
++    decisions: snapshot.decisions,
++    rejectedApproaches: snapshot.rejectedApproaches,
++    evidence: (publicationVerified ? [...snapshot.evidence, publication] : snapshot.evidence)
++      .filter((item) => !skipGeneric.has(evidenceKey(item))),
++    claims,
++    todos: snapshot.todos,
++    recovery: recoveryResult(status, blockers, capabilities),
++  };
++}
++
++function parseArgs(args) {
++  let root = process.cwd();
++  let planPath = null;
++  let workflow;
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    const value = args[index + 1];
++    if (arg === '--root') {
++      if (!value) throw new CliUsageError('--root requires a directory');
++      root = resolve(value);
++      index += 1;
++    } else if (arg === '--plan') {
++      if (!value) throw new CliUsageError('--plan requires a path');
++      planPath = value;
++      index += 1;
++    } else if (arg === '--workflow') {
++      if (!value) throw new CliUsageError('--workflow requires sdd or inline');
++      workflow = value;
++      index += 1;
++    } else {
++      throw new CliUsageError(`unknown argument: ${arg}`);
++    }
++  }
++  if (planPath === null) throw new CliUsageError('--plan is required');
++  return { root, planPath, workflow };
++}
++
++async function main() {
++  try {
++    const args = parseArgs(process.argv.slice(2));
++    const projection = await exportRecovery(args);
++    process.stdout.write(`${JSON.stringify(projection)}\n`);
++  } catch (error) {
++    process.stderr.write(`${error.message}\n`);
++    process.exitCode = error instanceof CliUsageError ? 2 : 1;
++  }
++}
++
++if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(process.argv[1]))) {
++  await main();
++}
+diff --git a/skills/tracking-providers/scripts/materialize-plan.mjs b/skills/tracking-providers/scripts/materialize-plan.mjs
+index e2163caf7c..220f4eec9f 100755
+--- a/skills/tracking-providers/scripts/materialize-plan.mjs
++++ b/skills/tracking-providers/scripts/materialize-plan.mjs
+@@ -81,6 +81,38 @@
+   return { title, spec, source, tasks };
+ }
+ 
++export function extractGlobalConstraints(markdown) {
++  const structuralMarkdown = withoutFencedCode(markdown);
++  const heading = /^## Global Constraints\s*$/m.exec(structuralMarkdown);
++  if (!heading) return [];
++  const rest = structuralMarkdown.slice(heading.index + heading[0].length);
++  const end = rest.search(/\n(?:---\s*$|#{1,6} )/m);
++  const body = (end === -1 ? rest : rest.slice(0, end)).replace(/^\n+/, '').replace(/\n+$/, '');
++  if (body === '') return [];
++  return body.split('\n').filter((line) => line.trim() !== '');
++}
++
++export function extractTaskBody(markdown, number) {
++  if (!Number.isInteger(number) || number < 1) {
++    throw new Error(`task ${number} not found`);
++  }
++  const lines = markdown.split('\n');
++  let infence = false;
++  let intask = false;
++  const out = [];
++  const heading = new RegExp(`^#+[ \\t]+Task[ \\t]+${number}([^0-9]|$)`);
++  for (const line of lines) {
++    if (/^```/.test(line)) infence = !infence;
++    if (!infence && /^#+\s+Task\s+\d+/.test(line)) {
++      intask = heading.test(line);
++    }
++    if (intask) out.push(line);
++  }
++  if (out.length === 0) throw new Error(`task ${number} not found`);
++  return `${out.join('\n')}\n`;
++}
++
++
+ function planRelativePath(root, planPath) {
+   const path = relative(resolve(root), resolve(planPath));
+   if (path === '' || path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path)) {
+diff --git a/skills/tracking-providers/scripts/migrate-recovery.mjs b/skills/tracking-providers/scripts/migrate-recovery.mjs
+new file mode 100755
+index 0000000000..d5fac23e37
+--- /dev/null
++++ b/skills/tracking-providers/scripts/migrate-recovery.mjs
+@@ -0,0 +1,501 @@
++#!/usr/bin/env node
++
++import { realpathSync } from 'node:fs';
++import { readFile } from 'node:fs/promises';
++import { join, resolve } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++import { parsePlan } from './materialize-plan.mjs';
++import { resolveConfig } from './resolve-config.mjs';
++import {
++  RecoveryError,
++  defaultPhase,
++  emptyTasks,
++  fileEvidence,
++  legacyWorkspaceDir,
++  normalizeSnapshot,
++  readProgress,
++  reconcileKata,
++  retainBytes,
++  retainSnapshotEvidence,
++  resolvePlanIdentity,
++  writeProgress,
++} from './recovery-lib.mjs';
++
++
++class CliUsageError extends Error {}
++
++const COMPLETE_RE = /^Task (\d+): complete \((.*)\)$/;
++const FIX_ROUND_RE = /^Task (\d+): fix round (\d+)\/5 \((.*)\)$/;
++const IMPLEMENTER_DONE_RE = /^Task (\d+): implementer DONE \((.*)\)$/;
++const MINOR_RE = /^Task (\d+): minor \(deferred\): (.+)$/;
++const PARKED_RE = /^Task (\d+): parked — (.+)$/;
++const RULING_TASK_RE = /^Task (\d+): Ruling: (.+)$/;
++const RULING_RE = /^Ruling: (.+)$/;
++const KATA_RE = /^Task (\d+): Kata (\S+)$/;
++const MODEL_RE = /^Task (\d+) implementer model: (.+)$/;
++const FIX_BASE_RE = /^Task (\d+): FIX_BASE (\S+)$/;
++const CHANGES_RE = /changes (\S+)\.\.(\S+)/;
++
++function parseChanges(text) {
++  const match = text.match(CHANGES_RE);
++  if (!match) return { base: null, head: null };
++  return { base: match[1], head: match[2] };
++}
++
++function splitRuling(text) {
++  const parts = text.split(' — ').map((part) => part.trim());
++  return {
++    summary: parts[0] ?? text,
++    rationale: parts[1] ?? text,
++    costIfWrong: parts[2] ?? null,
++  };
++}
++
++export function parseLegacyLedger(markdown, relativePath) {
++  const lines = markdown.split(/\r?\n/).map((line) => line.trimEnd());
++  const first = lines.find((line) => line.trim() !== '');
++  const identity = first?.match(/^# SDD ledger — plan: (.+)$/);
++  if (!identity) {
++    throw new RecoveryError('legacy ledger is missing a plan identity line', {
++      status: 'attention',
++      blockers: ['legacy-missing-identity'],
++    });
++  }
++  const namedPlan = identity[1].trim();
++  if (namedPlan !== relativePath) {
++    throw new RecoveryError(
++      `legacy ledger names ${namedPlan}, not ${relativePath}; leave it in place`,
++      {
++        status: 'contradictory',
++        blockers: ['legacy-other-plan', `named:${namedPlan}`],
++      },
++    );
++  }
++
++  const tasks = new Map();
++  let findings = [];
++  const decisions = [];
++  const rejectedApproaches = [];
++  const claims = [];
++
++  const blockers = [];
++  let findingSeq = 1;
++  let decisionSeq = 1;
++
++  const taskState = (number) => {
++    if (!tasks.has(number)) {
++      tasks.set(number, {
++        number,
++        state: 'pending',
++        phase: 'implement',
++        round: null,
++        nextAction: null,
++        commits: { base: null, head: null },
++        claim: null,
++      });
++    }
++    return tasks.get(number);
++  };
++
++  for (const raw of lines) {
++    const line = raw.trim();
++    if (line === '' || line === first.trim()) continue;
++
++    let match = line.match(COMPLETE_RE);
++    if (match) {
++      const number = Number(match[1]);
++      const task = taskState(number);
++      task.state = 'complete';
++      task.phase = 'complete';
++      task.round = null;
++      task.commits = parseChanges(match[2]);
++      findings = findings.filter((finding) => !(finding.task === number && finding.status === 'open'));
++      continue;
++    }
++    match = line.match(FIX_ROUND_RE);
++    if (match) {
++      const number = Number(match[1]);
++      const task = taskState(number);
++      task.state = 'fix';
++      task.phase = 'fix';
++      task.round = Number(match[2]);
++      task.commits = parseChanges(match[3]);
++      findings = findings.filter((finding) => !(finding.task === number && finding.status === 'open'));
++      const detail = match[3];
++      const openMatch = detail.match(/(\d+) open — (.+?); changes /);
++      if (openMatch && Number(openMatch[1]) > 0) {
++        for (const summary of openMatch[2].split(';').map((part) => part.trim()).filter(Boolean)) {
++          findings.push({
++            id: `legacy-open-${findingSeq}`,
++            task: number,
++            status: 'open',
++            summary,
++            evidence: [],
++          });
++          findingSeq += 1;
++        }
++      }
++      task.nextAction = `resume fix round ${task.round} for task ${number}`;
++      continue;
++    }
++    match = line.match(IMPLEMENTER_DONE_RE);
++
++    if (match) {
++      const number = Number(match[1]);
++      const task = taskState(number);
++      task.state = 'review';
++      task.phase = 'review';
++      task.commits = parseChanges(match[2]);
++      task.nextAction = `review task ${number}`;
++      continue;
++    }
++    match = line.match(MINOR_RE);
++    if (match) {
++      findings.push({
++        id: `legacy-minor-${findingSeq}`,
++        task: Number(match[1]),
++        status: 'minor',
++        summary: match[2],
++        evidence: [],
++      });
++      findingSeq += 1;
++      continue;
++    }
++    match = line.match(PARKED_RE);
++    if (match) {
++      const ruling = splitRuling(match[2]);
++      findings.push({
++        id: `legacy-parked-${findingSeq}`,
++        task: Number(match[1]),
++        status: 'parked',
++        summary: ruling.summary,
++        evidence: [],
++      });
++      decisions.push({
++        id: `legacy-parked-ruling-${decisionSeq}`,
++        task: Number(match[1]),
++        summary: ruling.summary,
++        rationale: ruling.rationale,
++        costIfWrong: ruling.costIfWrong,
++        sourceText: line,
++        evidence: [],
++      });
++      findingSeq += 1;
++      decisionSeq += 1;
++      continue;
++    }
++    match = line.match(RULING_TASK_RE);
++
++    if (match) {
++      const ruling = splitRuling(match[2]);
++      decisions.push({
++        id: `legacy-ruling-${decisionSeq}`,
++        task: Number(match[1]),
++        summary: ruling.summary,
++        rationale: ruling.rationale,
++        costIfWrong: ruling.costIfWrong,
++        sourceText: line,
++        evidence: [],
++      });
++
++      decisionSeq += 1;
++      continue;
++    }
++    match = line.match(RULING_RE);
++    if (match) {
++      const ruling = splitRuling(match[1]);
++      decisions.push({
++        id: `legacy-ruling-${decisionSeq}`,
++        task: null,
++        summary: ruling.summary,
++        rationale: ruling.rationale,
++        costIfWrong: ruling.costIfWrong,
++        sourceText: line,
++        evidence: [],
++      });
++
++      decisionSeq += 1;
++      continue;
++    }
++    match = line.match(KATA_RE);
++    if (match) {
++      const number = Number(match[1]);
++      const claim = {
++        kind: 'provider',
++        provider: 'kata',
++        ref: match[2],
++        observedRevision: null,
++        task: number,
++      };
++      taskState(number).claim = claim;
++      claims.push(claim);
++      continue;
++    }
++    match = line.match(MODEL_RE);
++    if (match) continue;
++    match = line.match(FIX_BASE_RE);
++    if (match) {
++      const task = taskState(Number(match[1]));
++      task.commits = { ...task.commits, base: task.commits.base ?? match[2] };
++      continue;
++    }
++
++    blockers.push(`ambiguous-legacy-line:${line}`);
++  }
++
++  if (blockers.length > 0) {
++    throw new RecoveryError('legacy ledger contains ambiguous lines; refusing guessed completion', {
++      status: 'attention',
++      blockers,
++    });
++  }
++
++  return { tasks, findings, decisions, rejectedApproaches, claims };
++}
++
++async function attachLegacyArtifacts(legacyDir, parsed, parsedPlan) {
++  const evidence = [];
++  const tasks = emptyTasks(parsedPlan, defaultPhase('sdd')).map((task) => {
++    const extra = parsed.tasks.get(task.number);
++    return extra
++      ? {
++        ...task,
++        state: extra.state,
++        phase: extra.phase,
++        round: extra.round,
++        nextAction: extra.nextAction,
++        claim: extra.claim,
++        commits: extra.commits,
++      }
++      : task;
++  });
++
++  for (const task of tasks) {
++    const briefPath = join(legacyDir, `task-${task.number}-brief.md`);
++    const reportPath = join(legacyDir, `task-${task.number}-report.md`);
++    try {
++      task.brief = await fileEvidence(briefPath);
++      evidence.push(task.brief);
++    } catch (error) {
++      if (error.code !== 'ENOENT' && error.status !== 'attention') throw error;
++    }
++    try {
++      task.report = await fileEvidence(reportPath);
++      evidence.push(task.report);
++    } catch (error) {
++      if (error.code !== 'ENOENT' && error.status !== 'attention') throw error;
++    }
++    if ((task.state === 'fix' || task.state === 'review') && !task.report) {
++      throw new RecoveryError(
++        `missing review evidence for task ${task.number} at ${reportPath}`,
++        {
++          status: 'attention',
++          blockers: [`missing-review-evidence:task-${task.number}`],
++        },
++      );
++    }
++  }
++
++  return { tasks, evidence };
++}
++
++function currentFromMigrated(tasks) {
++  const active = tasks.find((task) =>
++    task.state === 'in_progress' || task.state === 'review' || task.state === 'fix' || task.state === 'blocked',
++  );
++  if (active) {
++    return {
++      task: active.number,
++      phase: active.phase,
++      round: active.round,
++      nextAction: active.nextAction ?? `resume task ${active.number}`,
++    };
++  }
++  const pending = tasks.find((task) => task.state === 'pending');
++  if (pending) {
++    return {
++      task: pending.number,
++      phase: pending.phase,
++      round: null,
++      nextAction: `start task ${pending.number}`,
++    };
++  }
++  const last = tasks.at(-1);
++  return {
++    task: last?.number ?? null,
++    phase: last?.state === 'complete' ? 'complete' : (last?.phase ?? 'implement'),
++    round: last?.round ?? null,
++    nextAction: last?.state === 'complete' ? 'finish the change stack' : `resume task ${last?.number}`,
++  };
++}
++
++export async function migrateRecovery({
++
++  root,
++  planPath,
++  enroll = false,
++  config,
++  showIssue,
++  runtimeCheck = false,
++} = {}) {
++  if (enroll !== true) {
++    throw new RecoveryError('legacy conversion requires explicit enroll: true', {
++      status: 'ineligible',
++      blockers: ['enrollment-not-explicit'],
++    });
++  }
++
++  const identity = await resolvePlanIdentity(root, planPath);
++  const parsedPlan = parsePlan(identity.markdown);
++  const resolvedConfig = config ?? await resolveConfig(identity.root, { runtimeCheck });
++  const existing = await readProgress(identity);
++  if (existing.kind === 'snapshot') {
++    throw new RecoveryError('destination snapshot already exists; refusing to overwrite', {
++      status: 'contradictory',
++      blockers: ['already-enrolled'],
++    });
++  }
++
++  const legacyDir = legacyWorkspaceDir(identity.root, identity.relativePath);
++  const legacyProgress = join(legacyDir, 'progress.md');
++  let markdown;
++  try {
++    markdown = await readFile(legacyProgress, 'utf8');
++  } catch (error) {
++    if (error.code === 'ENOENT') {
++      throw new RecoveryError(`no legacy ledger at ${legacyProgress}`, {
++        status: 'attention',
++        blockers: ['missing-legacy-ledger'],
++      });
++    }
++    throw error;
++  }
++
++  const parsed = parseLegacyLedger(markdown, identity.relativePath);
++  const originalBytes = Buffer.from(markdown, 'utf8');
++  const preservedOriginal = await retainBytes(identity, 'legacy-progress.md', originalBytes);
++  const attached = await attachLegacyArtifacts(legacyDir, parsed, parsedPlan);
++  const execution = {
++    provider: resolvedConfig.execution.provider,
++    ...(resolvedConfig.execution.provider === 'kata'
++      ? { project: resolvedConfig.execution.project }
++      : {}),
++    completion: resolvedConfig.execution.completion,
++  };
++
++  const draft = normalizeSnapshot({
++    version: 1,
++    plan: { relativePath: identity.relativePath, sha256: identity.sha256 },
++    workflow: 'sdd',
++    execution,
++    revision: 1,
++    current: currentFromMigrated(attached.tasks),
++    tasks: attached.tasks,
++    findings: parsed.findings,
++    decisions: parsed.decisions,
++    rejectedApproaches: parsed.rejectedApproaches,
++    evidence: [preservedOriginal, ...attached.evidence],
++    claims: parsed.claims,
++    todos: execution.provider === 'session' ? [] : null,
++  }, identity, parsedPlan);
++
++  const overlay = await reconcileKata({
++    snapshot: draft,
++    identity,
++    execution,
++    showIssue,
++    root: identity.root,
++    overlayStates: false,
++  });
++  if (overlay.blockers.length > 0) {
++    throw new RecoveryError('refusing to enroll a snapshot that failed provider reconciliation', {
++      status: 'attention',
++      blockers: overlay.blockers,
++    });
++  }
++
++  const snapshot = normalizeSnapshot({
++    ...draft,
++    tasks: execution.provider === 'kata'
++      ? overlay.tasks.map((task) => ({
++        ...task,
++        claim: task.claim
++          ? {
++            kind: 'provider',
++            provider: 'kata',
++            ref: task.claim.ref,
++            uid: task.claim.uid ?? null,
++            project: task.claim.project ?? null,
++            shortId: task.claim.shortId ?? null,
++            observedRevision: task.claim.observedRevision,
++            task: task.claim.task ?? task.number,
++            labels: task.claim.labels ?? [],
++            owner: task.claim.owner ?? null,
++            lease: task.claim.lease ?? null,
++          }
++          : null,
++      }))
++      : draft.tasks,
++    claims: execution.provider === 'kata' ? overlay.claims : draft.claims,
++  }, identity, parsedPlan);
++
++  const retainedProjection = await retainSnapshotEvidence(identity, snapshot);
++  const published = await writeProgress(identity, retainedProjection.snapshot, { expectedRevision: 1 });
++  return {
++    enrolled: true,
++    planKey: identity.planKey,
++    progressPath: published.path,
++    preservedOriginal,
++    snapshotEvidence: published.snapshotEvidence,
++    eventId: published.eventId,
++    snapshot: retainedProjection.snapshot,
++  };
++}
++
++function parseArgs(args) {
++
++  let root = process.cwd();
++  let planPath = null;
++  let enroll = false;
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    const value = args[index + 1];
++    if (arg === '--root') {
++      if (!value) throw new CliUsageError('--root requires a directory');
++      root = resolve(value);
++      index += 1;
++    } else if (arg === '--plan') {
++      if (!value) throw new CliUsageError('--plan requires a path');
++      planPath = value;
++      index += 1;
++    } else if (arg === '--enroll') {
++      enroll = true;
++    } else {
++      throw new CliUsageError(`unknown argument: ${arg}`);
++    }
++  }
++  if (planPath === null) throw new CliUsageError('--plan is required');
++  return { root, planPath: resolve(root, planPath), enroll };
++}
++
++async function main() {
++  try {
++    const args = parseArgs(process.argv.slice(2));
++    const result = await migrateRecovery(args);
++    process.stdout.write(`${JSON.stringify({
++      enrolled: result.enrolled,
++      planKey: result.planKey,
++      progressPath: result.progressPath,
++      preservedOriginal: result.preservedOriginal,
++      snapshot: result.snapshot,
++    })}\n`);
++  } catch (error) {
++    process.stderr.write(`${error.message}\n`);
++    process.exitCode = error instanceof CliUsageError ? 2 : 1;
++  }
++}
++
++if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(process.argv[1]))) {
++  await main();
++}
+diff --git a/skills/tracking-providers/scripts/record-recovery.mjs b/skills/tracking-providers/scripts/record-recovery.mjs
+new file mode 100755
+index 0000000000..188a5e1a56
+--- /dev/null
++++ b/skills/tracking-providers/scripts/record-recovery.mjs
+@@ -0,0 +1,418 @@
++#!/usr/bin/env node
++
++import { realpathSync } from 'node:fs';
++import { mkdir, readFile, writeFile } from 'node:fs/promises';
++import { basename, dirname, resolve } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++
++import { parsePlan } from './materialize-plan.mjs';
++import { resolveConfig } from './resolve-config.mjs';
++import {
++  RecoveryError,
++  collectSnapshotEvidence,
++  defaultPhase,
++  emptyTasks,
++  eventIdFor,
++  normalizeSnapshot,
++  readProgress,
++  reconcileKata,
++  retainBytes,
++  retainCurrentSnapshot,
++  retainSnapshotEvidence,
++  resolvePlanIdentity,
++  verifyFileEvidence,
++  writeProgress,
++} from './recovery-lib.mjs';
++
++class CliUsageError extends Error {}
++
++function mergeUniqueEvidence(existing, extra) {
++  const out = [...existing];
++  for (const item of extra) {
++    if (!item) continue;
++    if (!out.some((entry) => entry.path === item.path && entry.sha256 === item.sha256 && entry.byteLength === item.byteLength)) {
++      out.push(item);
++    }
++  }
++  return out;
++}
++
++function applyTaskPatch(task, patch) {
++  if (!patch) return task;
++  const next = { ...task, commits: { ...task.commits } };
++  for (const key of ['state', 'phase', 'round', 'nextAction', 'title']) {
++    if (patch[key] !== undefined) next[key] = patch[key];
++  }
++  if (patch.brief !== undefined) next.brief = patch.brief;
++  if (patch.report !== undefined) next.report = patch.report;
++  if (patch.reviewPackage !== undefined) next.reviewPackage = patch.reviewPackage;
++  if (patch.claim !== undefined) next.claim = patch.claim;
++  if (patch.commits !== undefined) {
++    next.commits = {
++      base: patch.commits.base === undefined ? task.commits.base : patch.commits.base,
++      head: patch.commits.head === undefined ? task.commits.head : patch.commits.head,
++    };
++  }
++  return next;
++}
++
++function expectedNextRevision(progress, event) {
++  if (event.expectedRevision !== undefined) return event.expectedRevision;
++  if (progress.kind !== 'snapshot') return 1;
++  const revision = progress.raw?.revision;
++  return Number.isInteger(revision) && revision >= 1 ? revision + 1 : 1;
++}
++
++function snapshotClaims(claims) {
++  return claims.map((claim) => ({
++    kind: 'provider',
++    provider: 'kata',
++    ref: claim.ref,
++    uid: claim.uid ?? null,
++    project: claim.project ?? null,
++    shortId: claim.shortId ?? null,
++    observedRevision: claim.observedRevision,
++    task: claim.task ?? null,
++    labels: claim.labels ?? [],
++    owner: claim.owner ?? null,
++    lease: claim.lease ?? null,
++  }));
++}
++
++export async function recordRecovery({
++  root,
++  planPath,
++  event,
++  config,
++  showIssue,
++  runtimeCheck = false,
++} = {}) {
++  if (!event || typeof event !== 'object' || Array.isArray(event)) {
++    throw new RecoveryError('record event must be an object', {
++      status: 'unsupported',
++      blockers: ['invalid-event'],
++    });
++  }
++
++  const identity = await resolvePlanIdentity(root, planPath);
++  const parsedPlan = parsePlan(identity.markdown);
++  const resolvedConfig = config ?? await resolveConfig(identity.root, { runtimeCheck });
++  const progress = await readProgress(identity);
++  if (progress.kind === 'legacy' || progress.kind === 'unknown') {
++    throw new RecoveryError('enrolled writers refuse legacy or unknown progress; migrate explicitly first', {
++      status: 'unsupported',
++      blockers: [progress.kind === 'legacy' ? 'legacy-progress' : 'unknown-progress'],
++    });
++  }
++
++  const workflow = event.workflow
++    ?? (progress.kind === 'snapshot' ? progress.raw.workflow : null)
++    ?? 'sdd';
++  const execution = {
++    provider: resolvedConfig.execution.provider,
++    ...(resolvedConfig.execution.provider === 'kata'
++      ? { project: resolvedConfig.execution.project }
++      : {}),
++    completion: resolvedConfig.execution.completion,
++  };
++  const nextRevision = expectedNextRevision(progress, event);
++  if (progress.kind === 'snapshot') {
++    if (progress.raw.plan?.sha256 && progress.raw.plan.sha256 !== identity.sha256) {
++      throw new RecoveryError('plan digest changed; refuse to record against a stale snapshot', {
++        status: 'attention',
++        blockers: [`plan-digest-changed:${progress.raw.plan.sha256}:${identity.sha256}`],
++      });
++    }
++    if (nextRevision !== progress.raw.revision + 1) {
++      throw new RecoveryError('expectedRevision does not follow the published snapshot', {
++        status: 'attention',
++        blockers: [`expected-revision:${progress.raw.revision}:${nextRevision}`],
++      });
++    }
++  } else if (nextRevision !== 1) {
++    throw new RecoveryError('first record must use expectedRevision 1', {
++      status: 'attention',
++      blockers: ['expected-revision-not-initial'],
++    });
++  }
++
++  const plannedWrites = new Map();
++  for (const file of event.writeFiles ?? []) {
++    if (typeof file?.path !== 'string' || !file.path || file.contents === undefined) {
++      throw new RecoveryError('writeFiles entries require path and contents', {
++        status: 'attention',
++        blockers: ['invalid-write-file'],
++      });
++    }
++    const path = resolve(identity.root, file.path);
++    if (plannedWrites.has(path)) throw new RecoveryError(`duplicate output path: ${path}`);
++    plannedWrites.set(path, Buffer.from(file.contents));
++  }
++  const verifiedRefs = event.evidenceRefs ?? [];
++  if (!Array.isArray(verifiedRefs)) throw new RecoveryError('evidenceRefs must be an array');
++
++  const base = progress.kind === 'snapshot'
++    ? normalizeSnapshot(progress.raw, identity, parsedPlan)
++    : normalizeSnapshot({
++      version: 1,
++      plan: { relativePath: identity.relativePath, sha256: identity.sha256 },
++      workflow,
++      execution,
++      revision: 1,
++      current: {
++        task: parsedPlan.tasks[0]?.number ?? null,
++        phase: defaultPhase(workflow),
++        round: null,
++        nextAction: event.nextAction ?? event.current?.nextAction ?? `start task ${parsedPlan.tasks[0]?.number ?? 1}`,
++      },
++      tasks: emptyTasks(parsedPlan, defaultPhase(workflow)),
++      findings: [],
++      decisions: [],
++      rejectedApproaches: [],
++      evidence: [],
++      claims: [],
++      todos: execution.provider === 'session' ? [] : null,
++    }, identity, parsedPlan);
++
++  if (event.workflow && event.workflow !== base.workflow) {
++    throw new RecoveryError('cannot change enrolled workflow', {
++      status: 'contradictory',
++      blockers: ['workflow-change'],
++    });
++  }
++
++  let tasks = base.tasks.map((task) => ({ ...task, commits: { ...task.commits } }));
++  if (Array.isArray(event.tasks)) {
++    for (const patch of event.tasks) {
++      const index = tasks.findIndex((task) => task.number === patch.number);
++      if (index === -1) {
++        throw new RecoveryError(`record event names unknown task ${patch.number}`, {
++          status: 'unsupported',
++          blockers: [`unknown-task:${patch.number}`],
++        });
++      }
++      tasks[index] = applyTaskPatch(tasks[index], patch);
++    }
++  }
++
++  if (event.type === 'fix-round') {
++    const index = tasks.findIndex((task) => task.number === event.task);
++    if (index === -1) {
++      throw new RecoveryError(`fix-round names unknown task ${event.task}`, {
++        status: 'unsupported',
++        blockers: [`unknown-task:${event.task}`],
++      });
++    }
++    tasks[index] = applyTaskPatch(tasks[index], {
++      state: 'fix',
++      phase: 'fix',
++      round: event.round,
++      nextAction: event.nextAction ?? `resume fix round ${event.round} for task ${event.task}`,
++      commits: event.changes ?? tasks[index].commits,
++    });
++  }
++
++  if (event.type === 'complete-task') {
++    const index = tasks.findIndex((task) => task.number === event.task);
++    if (index === -1) {
++      throw new RecoveryError(`complete-task names unknown task ${event.task}`, {
++        status: 'unsupported',
++        blockers: [`unknown-task:${event.task}`],
++      });
++    }
++    tasks[index] = applyTaskPatch(tasks[index], {
++      state: 'complete',
++      phase: 'complete',
++      round: null,
++      nextAction: null,
++      commits: event.changes ?? tasks[index].commits,
++    });
++  }
++
++  const findings = event.findings ? [...event.findings] : [...base.findings];
++  const decisions = event.decisions ? [...event.decisions] : [...base.decisions];
++  const rejectedApproaches = event.rejectedApproaches
++    ? [...event.rejectedApproaches]
++    : [...base.rejectedApproaches];
++  if (event.finding) findings.push(event.finding);
++  if (event.decision) decisions.push(event.decision);
++  if (event.rejectedApproach) rejectedApproaches.push(event.rejectedApproach);
++
++  if (event.type === 'complete-task' && findings.some((finding) => finding.task === event.task && finding.status === 'open')) {
++    throw new RecoveryError(`cannot complete task ${event.task} with open findings`, {
++      status: 'contradictory',
++      blockers: [`complete-with-open-findings:${event.task}`],
++    });
++  }
++
++  const claims = event.claims ? [...event.claims] : [...base.claims];
++  if (event.claim) claims.push(event.claim);
++  for (const task of tasks) {
++    if (task.claim && !claims.some((claim) => claim.ref === task.claim.ref && claim.task === task.number)) {
++      claims.push({ ...task.claim, task: task.number });
++    }
++  }
++
++  const current = {
++    task: event.current?.task !== undefined ? event.current.task : (
++      event.task !== undefined ? event.task : base.current.task
++    ),
++    phase: event.current?.phase ?? event.phase ?? (
++      event.type === 'fix-round' ? 'fix' : event.type === 'complete-task' ? 'complete' : base.current.phase
++    ),
++    round: event.current?.round !== undefined ? event.current.round : (
++      event.round !== undefined ? event.round : base.current.round
++    ),
++    nextAction: event.nextAction ?? event.current?.nextAction ?? base.current.nextAction,
++  };
++
++  if (event.type === 'complete-task') {
++    const nextPending = tasks.find((task) => task.state === 'pending');
++    if (nextPending && event.nextAction === undefined && event.current?.nextAction === undefined) {
++      current.task = nextPending.number;
++      current.phase = defaultPhase(workflow);
++      current.round = null;
++      current.nextAction = `start task ${nextPending.number}`;
++    }
++  }
++
++  const candidate = {
++    version: 1,
++    plan: { relativePath: identity.relativePath, sha256: identity.sha256 },
++    workflow,
++    execution,
++    revision: nextRevision,
++    current,
++    tasks,
++    findings,
++    decisions,
++    rejectedApproaches,
++    evidence: mergeUniqueEvidence(base.evidence, verifiedRefs),
++    claims: snapshotClaims(claims),
++    todos: event.todos !== undefined ? event.todos : base.todos,
++  };
++  const draft = normalizeSnapshot(candidate, identity, parsedPlan);
++
++  const overlay = await reconcileKata({
++    snapshot: draft,
++    identity,
++    execution,
++    showIssue,
++    root: identity.root,
++    overlayStates: false,
++  });
++  if (overlay.blockers.length > 0) {
++    throw new RecoveryError('refusing to acknowledge a snapshot that failed provider reconciliation', {
++      status: overlay.blockers.some((item) => item.startsWith('closed-child-unfinished-review:'))
++        ? 'contradictory'
++        : 'attention',
++      blockers: overlay.blockers,
++    });
++  }
++
++  if (execution.provider === 'kata') {
++    for (const task of overlay.tasks) {
++      if (!task.claim || !Number.isInteger(task.claim.observedRevision)) {
++        throw new RecoveryError(`missing Kata mapping or revision for task ${task.number}`, {
++          status: 'attention',
++          blockers: [`missing-task-mapping:${task.number}`],
++        });
++      }
++    }
++    candidate.tasks = overlay.tasks.map((task) => ({
++      ...task,
++      claim: snapshotClaims([task.claim])[0],
++    }));
++    candidate.claims = snapshotClaims(overlay.claims);
++  }
++
++  const validated = normalizeSnapshot(candidate, identity, parsedPlan);
++
++  const retainedProjection = await retainSnapshotEvidence(identity, validated, plannedWrites);
++  const retained = await retainCurrentSnapshot(identity, progress);
++  const writtenEvidence = [...retainedProjection.retained];
++  for (const [path, bytes] of plannedWrites) {
++    await mkdir(dirname(path), { recursive: true });
++    await writeFile(path, bytes);
++    writtenEvidence.push(await retainBytes(identity, basename(path), bytes));
++  }
++
++  const snapshot = normalizeSnapshot({
++    ...retainedProjection.snapshot,
++    evidence: mergeUniqueEvidence(retainedProjection.snapshot.evidence, [...retained, ...writtenEvidence]),
++  }, identity, parsedPlan);
++
++  for (const evidence of collectSnapshotEvidence(snapshot)) {
++    await verifyFileEvidence(evidence);
++  }
++
++  const published = await writeProgress(identity, snapshot, { expectedRevision: nextRevision });
++  return {
++    acknowledged: true,
++    revision: published.revision,
++    eventId: published.eventId ?? eventIdFor(identity.planKey, published.revision),
++    snapshotEvidence: published.snapshotEvidence,
++    retained,
++    evidence: writtenEvidence,
++    progressPath: published.path,
++    snapshot,
++  };
++}
++
++function parseArgs(args) {
++  let root = process.cwd();
++  let planPath = null;
++  let eventJson = null;
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    const value = args[index + 1];
++    if (arg === '--root') {
++      if (!value) throw new CliUsageError('--root requires a directory');
++      root = resolve(value);
++      index += 1;
++    } else if (arg === '--plan') {
++      if (!value) throw new CliUsageError('--plan requires a path');
++      planPath = value;
++      index += 1;
++    } else if (arg === '--event') {
++      if (!value) throw new CliUsageError('--event requires JSON');
++      eventJson = value;
++      index += 1;
++    } else {
++      throw new CliUsageError(`unknown argument: ${arg}`);
++    }
++  }
++  if (planPath === null) throw new CliUsageError('--plan is required');
++  if (eventJson === null) throw new CliUsageError('--event is required');
++  let event;
++  try {
++    event = JSON.parse(eventJson);
++  } catch (error) {
++    throw new CliUsageError(`--event is not valid JSON: ${error.message}`);
++  }
++  return { root, planPath, event };
++}
++
++async function main() {
++  try {
++    const args = parseArgs(process.argv.slice(2));
++    const result = await recordRecovery(args);
++    process.stdout.write(`${JSON.stringify({
++      acknowledged: result.acknowledged,
++      revision: result.revision,
++      eventId: result.eventId,
++      snapshotEvidence: result.snapshotEvidence,
++      retained: result.retained,
++      evidence: result.evidence,
++      progressPath: result.progressPath,
++    })}\n`);
++  } catch (error) {
++    process.stderr.write(`${error.message}\n`);
++    process.exitCode = error instanceof CliUsageError ? 2 : 1;
++  }
++}
++
++if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(process.argv[1]))) {
++  await main();
++}
+diff --git a/skills/tracking-providers/scripts/recovery-lib.mjs b/skills/tracking-providers/scripts/recovery-lib.mjs
+new file mode 100644
+index 0000000000..795b0aa975
+--- /dev/null
++++ b/skills/tracking-providers/scripts/recovery-lib.mjs
+@@ -0,0 +1,1272 @@
++import { createHash } from 'node:crypto';
++import { constants as fsConstants, realpathSync } from 'node:fs';
++import {
++  lstat,
++  mkdir,
++  open as fsOpen,
++  readFile,
++  realpath,
++  rename,
++  unlink,
++} from 'node:fs/promises';
++import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++export const SNAPSHOT_VERSION = 1;
++export const SNAPSHOT_MARKER = '<!-- sjujperpowers-work-snapshot:1 -->';
++export const WORKFLOW_VALUES = Object.freeze(['sdd', 'inline']);
++export const EXECUTION_PROVIDERS = Object.freeze(['kata', 'session', 'none']);
++export const RECOVERY_STATUSES = Object.freeze([
++  'eligible',
++  'ineligible',
++  'unsupported',
++  'contradictory',
++  'attention',
++]);
++export const TASK_STATES = Object.freeze([
++  'pending',
++  'in_progress',
++  'review',
++  'fix',
++  'complete',
++  'blocked',
++  'contradictory',
++]);
++export const FINDING_STATUSES = Object.freeze(['open', 'addressed', 'parked', 'minor']);
++
++const SDD_DIR = '.sjujperpowers/sdd';
++const GITIGNORE_BODY = '*\n';
++
++export class RecoveryError extends Error {
++  constructor(message, { status = 'attention', blockers = [] } = {}) {
++    super(message);
++    this.name = 'RecoveryError';
++    this.status = status;
++    this.blockers = blockers;
++  }
++}
++
++export function posixRelative(from, to) {
++  const path = relative(resolve(from), resolve(to));
++  if (path === '' || path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path)) {
++    throw new RecoveryError('plan must be inside repository root', {
++      status: 'unsupported',
++      blockers: ['plan-outside-root'],
++    });
++  }
++  return path.split(sep).join('/');
++}
++
++export function planKey(relativePath) {
++  if (typeof relativePath !== 'string' || relativePath === '' || relativePath.includes('\\')) {
++    throw new RecoveryError('plan key requires a canonical repository-relative path', {
++      status: 'unsupported',
++      blockers: ['invalid-relative-path'],
++    });
++  }
++  return createHash('sha256').update(relativePath, 'utf8').digest('hex');
++}
++
++export function workspaceDir(root, relativePath) {
++  return join(root, SDD_DIR, planKey(relativePath));
++}
++
++export function progressPath(root, relativePath) {
++  return join(workspaceDir(root, relativePath), 'progress.md');
++}
++
++export function legacyWorkspaceDir(root, relativePath) {
++  const base = relativePath.split('/').pop() ?? relativePath;
++  const slug = base.replace(/\.md$/i, '');
++  return join(root, SDD_DIR, slug);
++}
++
++export function eventIdFor(planKeyValue, revision) {
++  return `sjujperpowers:record:${planKeyValue}:r${revision}`;
++}
++
++async function rejectSymlink(path, label) {
++  let st;
++  try {
++    st = await lstat(path);
++  } catch (error) {
++    if (error.code === 'ENOENT') return null;
++    throw error;
++  }
++  if (st.isSymbolicLink()) {
++    throw new RecoveryError(`${label} is a symlink; refuse identity ambiguity`, {
++      status: 'unsupported',
++      blockers: [`symlink:${label}`],
++    });
++  }
++  return st;
++}
++
++async function rejectSymlinkAncestors(path, stopAt, label) {
++  let current = path;
++  while (true) {
++    await rejectSymlink(current, `${label}:${relative(stopAt, current) || '.'}`);
++    if (current === stopAt) return;
++    const parent = dirname(current);
++    if (parent === current) return;
++    const rel = relative(stopAt, parent);
++    if (rel.startsWith('..') || isAbsolute(rel)) return;
++    current = parent;
++  }
++}
++
++export async function resolvePlanIdentity(root, planPath) {
++  if (typeof root !== 'string' || root.trim() === '') {
++    throw new RecoveryError('repository root is required', {
++      status: 'unsupported',
++      blockers: ['missing-root'],
++    });
++  }
++  if (typeof planPath !== 'string' || planPath.trim() === '') {
++    throw new RecoveryError('plan path is required', {
++      status: 'unsupported',
++      blockers: ['missing-plan-path'],
++    });
++  }
++
++  const rootResolved = resolve(root);
++  await rejectSymlink(rootResolved, 'repository root');
++  const rootReal = await realpath(rootResolved);
++  const givenPlan = isAbsolute(planPath) ? resolve(planPath) : resolve(rootResolved, planPath);
++
++  const planStat = await rejectSymlink(givenPlan, 'plan path');
++  if (planStat === null) {
++    throw new RecoveryError(`no such plan file: ${givenPlan}`, {
++      status: 'attention',
++      blockers: ['missing-plan'],
++    });
++  }
++  if (!planStat.isFile()) {
++    throw new RecoveryError('plan path is not a regular file', {
++      status: 'unsupported',
++      blockers: ['plan-not-file'],
++    });
++  }
++  await rejectSymlinkAncestors(givenPlan, rootResolved, 'plan ancestor');
++
++  const planReal = await realpath(givenPlan);
++  const relativePath = posixRelative(rootReal, planReal);
++  await rejectSymlinkAncestors(planReal, rootReal, 'plan ancestor');
++  const key = planKey(relativePath);
++  const workspace = join(rootReal, SDD_DIR, key);
++
++  const sddBase = join(rootReal, SDD_DIR);
++  await rejectSymlink(sddBase, 'sdd directory');
++  await rejectSymlink(workspace, 'recovery workspace');
++  await rejectSymlink(join(rootReal, '.sjujperpowers'), '.sjujperpowers');
++  if ((await rejectSymlink(sddBase, 'sdd directory')) !== null) {
++    await rejectSymlinkAncestors(sddBase, rootReal, 'sdd ancestor');
++  }
++  if ((await rejectSymlink(workspace, 'recovery workspace')) !== null) {
++    await rejectSymlinkAncestors(workspace, rootReal, 'workspace ancestor');
++  }
++
++  const bytes = await readFile(planReal);
++  const sha256 = createHash('sha256').update(bytes).digest('hex');
++
++  return {
++    root: rootReal,
++    planPath: planReal,
++    relativePath,
++    sha256,
++    byteLength: bytes.byteLength,
++    planKey: key,
++    workspace,
++    progressPath: join(workspace, 'progress.md'),
++    retainedDir: join(workspace, 'retained'),
++    markdown: bytes.toString('utf8'),
++  };
++}
++
++export function digestBytes(bytes, byteLength = bytes.byteLength) {
++  if (!Number.isInteger(byteLength) || byteLength < 0 || byteLength > bytes.byteLength) {
++    throw new RecoveryError('evidence byteLength is outside the referenced bytes', {
++      status: 'attention',
++      blockers: ['invalid-byte-length'],
++    });
++  }
++  const slice = bytes.subarray(0, byteLength);
++  return {
++    byteLength,
++    sha256: createHash('sha256').update(slice).digest('hex'),
++  };
++}
++
++export function fileEvidenceFromBytes(path, bytes, byteLength = bytes.byteLength) {
++  const digest = digestBytes(bytes, byteLength);
++  return {
++    kind: 'file',
++    path,
++    byteLength: digest.byteLength,
++    sha256: digest.sha256,
++  };
++}
++
++export async function fileEvidence(path, byteLength) {
++  const st = await rejectSymlink(path, 'evidence path');
++  if (st === null) {
++    const error = new Error(`no such evidence file: ${path}`);
++    error.code = 'ENOENT';
++    throw error;
++  }
++  const canonical = await realpath(path);
++  const bytes = await readFile(canonical);
++  return fileEvidenceFromBytes(canonical, bytes, byteLength ?? bytes.byteLength);
++}
++
++export async function verifyFileEvidence(evidence) {
++  if (!evidence || evidence.kind !== 'file') {
++    throw new RecoveryError('evidence is not a file reference', {
++      status: 'attention',
++      blockers: ['non-file-evidence'],
++    });
++  }
++  await rejectSymlink(evidence.path, 'evidence path');
++  const bytes = await readFile(evidence.path);
++  if (bytes.byteLength < evidence.byteLength) {
++    throw new RecoveryError(`evidence truncated: ${evidence.path}`, {
++      status: 'attention',
++      blockers: [`truncated:${evidence.path}`],
++    });
++  }
++  const digest = digestBytes(bytes, evidence.byteLength);
++  if (digest.sha256 !== evidence.sha256) {
++    throw new RecoveryError(`evidence bytes changed: ${evidence.path}`, {
++      status: 'attention',
++      blockers: [`mutated:${evidence.path}`],
++    });
++  }
++  return true;
++}
++
++async function syncHandle(path, flags) {
++  const fh = await fsOpen(path, flags);
++  try {
++    await fh.sync();
++  } finally {
++    await fh.close();
++  }
++}
++
++async function openExclusive(path) {
++  await rejectSymlink(path, 'publication path');
++  try {
++    return await fsOpen(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
++  } catch (error) {
++    throw new RecoveryError(`exclusive publication failed: ${path}: ${error.message}`, {
++      status: 'attention',
++      blockers: [error.code === 'EEXIST' ? 'publication-conflict' : 'publication-open-failed'],
++    });
++  }
++}
++
++export async function writeExclusiveSynced(path, bytes) {
++  const fh = await openExclusive(path);
++  try {
++    await fh.writeFile(bytes);
++    await fh.sync();
++  } catch (error) {
++    throw new RecoveryError(`publication write failed: ${error.message}`, {
++      status: 'attention',
++      blockers: ['publication-write-failed'],
++    });
++  } finally {
++    await fh.close();
++  }
++}
++
++export async function syncDirectory(path) {
++  try {
++    await syncHandle(path, 'r');
++  } catch (error) {
++    throw new RecoveryError(`directory sync failed: ${error.message}`, {
++      status: 'attention',
++      blockers: ['directory-sync-failed'],
++    });
++  }
++}
++
++export async function ensureWorkspace(identity) {
++  const base = join(identity.root, SDD_DIR);
++  await rejectSymlinkAncestors(identity.retainedDir, identity.root, 'workspace ancestor');
++  await mkdir(base, { recursive: true });
++  await mkdir(identity.workspace, { recursive: true });
++  await mkdir(identity.retainedDir, { recursive: true });
++  await rejectSymlink(base, 'sdd directory');
++  await rejectSymlink(identity.workspace, 'recovery workspace');
++  await rejectSymlink(identity.retainedDir, 'retained directory');
++  await rejectSymlinkAncestors(identity.workspace, identity.root, 'workspace ancestor');
++
++  const gitignore = join(base, '.gitignore');
++  await rejectSymlink(gitignore, 'sdd gitignore');
++  let existing = null;
++  try {
++    existing = await readFile(gitignore, 'utf8');
++  } catch (error) {
++    if (error.code !== 'ENOENT') throw error;
++  }
++  if (existing === null) {
++    await writeExclusiveSynced(gitignore, GITIGNORE_BODY);
++  } else if (existing !== GITIGNORE_BODY && existing.trim() !== '*') {
++    throw new RecoveryError('refusing to overwrite incompatible .sjujperpowers/sdd/.gitignore', {
++      status: 'unsupported',
++      blockers: ['incompatible-gitignore'],
++    });
++  }
++  await syncDirectory(identity.retainedDir);
++  await syncDirectory(identity.workspace);
++  await syncDirectory(base);
++  await syncDirectory(dirname(base));
++  await syncDirectory(identity.root);
++  return identity.workspace;
++}
++
++export async function retainBytes(identity, basename, bytes) {
++  await ensureWorkspace(identity);
++  const digest = createHash('sha256').update(bytes).digest('hex');
++  const safe = String(basename).replace(/[^A-Za-z0-9._-]+/g, '_');
++  const dest = join(identity.retainedDir, `${digest}-${safe}`);
++  await rejectSymlink(dest, 'retained evidence');
++  try {
++    await writeExclusiveSynced(dest, bytes);
++  } catch (error) {
++    if (!error.blockers?.includes('publication-conflict')) throw error;
++    await verifyFileEvidence(fileEvidenceFromBytes(dest, bytes));
++  }
++  await syncDirectory(identity.retainedDir);
++  return fileEvidenceFromBytes(dest, bytes);
++}
++
++export async function retainCurrentSnapshot(identity, progress) {
++  if (progress.kind !== 'snapshot' || typeof progress.markdown !== 'string') return [];
++  const bytes = Buffer.from(progress.markdown, 'utf8');
++  const retained = await retainBytes(identity, `snapshot-r${progress.raw.revision}.md`, bytes);
++  return [retained];
++}
++
++function requiredString(value, field) {
++  if (typeof value !== 'string' || value.trim() === '') {
++    throw new RecoveryError(`${field} must be a non-empty string`, {
++      status: 'unsupported',
++      blockers: [`missing:${field}`],
++    });
++  }
++  return value;
++}
++
++function requiredInteger(value, field, { allowNull = false, min = 0 } = {}) {
++  if (value === null && allowNull) return null;
++  if (!Number.isInteger(value) || value < min) {
++    throw new RecoveryError(`${field} must be an integer`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}`],
++    });
++  }
++  return value;
++}
++
++function requiredArray(value, field) {
++  if (!Array.isArray(value)) {
++    throw new RecoveryError(`${field} must be an array`, {
++      status: 'unsupported',
++      blockers: [`missing:${field}`],
++    });
++  }
++  return value;
++}
++
++function normalizeFileEvidence(value, field) {
++  if (value === null) return null;
++  if (value === undefined) {
++    throw new RecoveryError(`${field} must not be undefined`, {
++      status: 'unsupported',
++      blockers: [`undefined:${field}`],
++    });
++  }
++  if (value.kind !== 'file' || typeof value.path !== 'string' || value.path === '') {
++    throw new RecoveryError(`${field} must be file evidence`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}`],
++    });
++  }
++  if (!Number.isInteger(value.byteLength) || value.byteLength < 0) {
++    throw new RecoveryError(`${field}.byteLength must be a non-negative integer`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}.byteLength`],
++    });
++  }
++  if (typeof value.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(value.sha256)) {
++    throw new RecoveryError(`${field}.sha256 must be a 64-character hex digest`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}.sha256`],
++    });
++  }
++  return {
++    kind: 'file',
++    path: value.path,
++    byteLength: value.byteLength,
++    sha256: value.sha256,
++  };
++}
++
++function normalizeLease(value, field) {
++  if (value === null) return null;
++  if (!value || typeof value !== 'object') {
++    throw new RecoveryError(`${field} must be a lease object or null`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}`],
++    });
++  }
++  return {
++    holder: value.holder === null || value.holder === undefined ? null : requiredString(value.holder, `${field}.holder`),
++    holderInstanceUid: value.holderInstanceUid === null || value.holderInstanceUid === undefined
++      ? null
++      : requiredString(value.holderInstanceUid, `${field}.holderInstanceUid`),
++    claimKind: value.claimKind === null || value.claimKind === undefined
++      ? null
++      : requiredString(value.claimKind, `${field}.claimKind`),
++    claimUid: value.claimUid === null || value.claimUid === undefined
++      ? null
++      : requiredString(value.claimUid, `${field}.claimUid`),
++    revision: requiredInteger(value.revision, `${field}.revision`, { allowNull: true, min: 0 }),
++    expiresAt: value.expiresAt === null || value.expiresAt === undefined
++      ? null
++      : requiredString(value.expiresAt, `${field}.expiresAt`),
++    releasedAt: value.releasedAt === null || value.releasedAt === undefined
++      ? null
++      : requiredString(value.releasedAt, `${field}.releasedAt`),
++  };
++}
++
++function normalizeClaim(value, field) {
++  if (value === null) return null;
++  if (value === undefined) {
++    throw new RecoveryError(`${field} must not be undefined`, {
++      status: 'unsupported',
++      blockers: [`undefined:${field}`],
++    });
++  }
++  if (value.kind !== 'provider' || value.provider !== 'kata') {
++    throw new RecoveryError(`${field} must be a kata provider reference`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}`],
++    });
++  }
++  return {
++    kind: 'provider',
++    provider: 'kata',
++    ref: requiredString(value.ref, `${field}.ref`),
++    uid: value.uid === undefined || value.uid === null ? null : requiredString(value.uid, `${field}.uid`),
++    project: value.project === undefined || value.project === null
++      ? null
++      : requiredString(value.project, `${field}.project`),
++    shortId: value.shortId === undefined || value.shortId === null
++      ? null
++      : requiredString(value.shortId, `${field}.shortId`),
++    observedRevision: requiredInteger(value.observedRevision, `${field}.observedRevision`, {
++      allowNull: true,
++      min: 0,
++    }),
++    task: requiredInteger(value.task, `${field}.task`, { allowNull: true, min: 1 }),
++    labels: Array.isArray(value.labels) ? value.labels.map((label, index) => requiredString(label, `${field}.labels[${index}]`)) : [],
++    owner: value.owner === undefined || value.owner === null ? null : requiredString(value.owner, `${field}.owner`),
++    lease: value.lease === undefined ? null : normalizeLease(value.lease, `${field}.lease`),
++  };
++}
++
++function normalizeFinding(value, index) {
++  const field = `findings[${index}]`;
++  if (!FINDING_STATUSES.includes(value.status)) {
++    throw new RecoveryError(`${field}.status is unsupported`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}.status`],
++    });
++  }
++  return {
++    id: requiredString(value.id, `${field}.id`),
++    task: requiredInteger(value.task, `${field}.task`, { min: 1 }),
++    status: value.status,
++    summary: requiredString(value.summary, `${field}.summary`),
++    evidence: requiredArray(value.evidence, `${field}.evidence`).map((item, evidenceIndex) =>
++      normalizeFileEvidence(item, `${field}.evidence[${evidenceIndex}]`),
++    ),
++  };
++}
++
++function normalizeDecision(value, index) {
++  const field = `decisions[${index}]`;
++  return {
++    id: requiredString(value.id, `${field}.id`),
++    task: requiredInteger(value.task, `${field}.task`, { allowNull: true, min: 1 }),
++    summary: requiredString(value.summary, `${field}.summary`),
++    rationale: requiredString(value.rationale, `${field}.rationale`),
++    costIfWrong: value.costIfWrong === undefined || value.costIfWrong === null
++      ? null
++      : requiredString(value.costIfWrong, `${field}.costIfWrong`),
++    sourceText: value.sourceText === undefined || value.sourceText === null
++      ? null
++      : requiredString(value.sourceText, `${field}.sourceText`),
++    evidence: requiredArray(value.evidence, `${field}.evidence`).map((item, evidenceIndex) =>
++      normalizeFileEvidence(item, `${field}.evidence[${evidenceIndex}]`),
++    ),
++  };
++}
++
++function normalizeRejected(value, index) {
++  const field = `rejectedApproaches[${index}]`;
++  return {
++    id: requiredString(value.id, `${field}.id`),
++    task: requiredInteger(value.task, `${field}.task`, { allowNull: true, min: 1 }),
++    summary: requiredString(value.summary, `${field}.summary`),
++    reason: requiredString(value.reason, `${field}.reason`),
++    evidence: requiredArray(value.evidence, `${field}.evidence`).map((item, evidenceIndex) =>
++      normalizeFileEvidence(item, `${field}.evidence[${evidenceIndex}]`),
++    ),
++  };
++}
++
++function normalizeTodo(value, index) {
++  const field = `todos[${index}]`;
++  const statuses = ['pending', 'in_progress', 'completed'];
++  if (!statuses.includes(value.status)) {
++    throw new RecoveryError(`${field}.status is unsupported`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}.status`],
++    });
++  }
++  return {
++    id: requiredString(value.id, `${field}.id`),
++    content: requiredString(value.content, `${field}.content`),
++    status: value.status,
++  };
++}
++
++function normalizeTask(value, index, titles) {
++  const field = `tasks[${index}]`;
++  const number = requiredInteger(value.number, `${field}.number`, { min: 1 });
++  if (!TASK_STATES.includes(value.state)) {
++    throw new RecoveryError(`${field}.state is unsupported`, {
++      status: 'unsupported',
++      blockers: [`invalid:${field}.state`],
++    });
++  }
++  const title = requiredString(value.title ?? titles.get(number), `${field}.title`);
++  const commits = value.commits;
++  if (!commits || typeof commits !== 'object') {
++    throw new RecoveryError(`${field}.commits must be an object`, {
++      status: 'unsupported',
++      blockers: [`missing:${field}.commits`],
++    });
++  }
++  return {
++    number,
++    title,
++    state: value.state,
++    phase: requiredString(value.phase, `${field}.phase`),
++    round: requiredInteger(value.round, `${field}.round`, { allowNull: true, min: 1 }),
++    nextAction: value.nextAction === undefined || value.nextAction === null
++      ? null
++      : requiredString(value.nextAction, `${field}.nextAction`),
++    brief: value.brief === undefined ? null : normalizeFileEvidence(value.brief, `${field}.brief`),
++    report: value.report === undefined ? null : normalizeFileEvidence(value.report, `${field}.report`),
++    reviewPackage: value.reviewPackage === undefined
++      ? null
++      : normalizeFileEvidence(value.reviewPackage, `${field}.reviewPackage`),
++    claim: value.claim === undefined ? null : normalizeClaim(value.claim, `${field}.claim`),
++    commits: {
++      base: commits.base === undefined || commits.base === null ? null : requiredString(commits.base, `${field}.commits.base`),
++      head: commits.head === undefined || commits.head === null ? null : requiredString(commits.head, `${field}.commits.head`),
++    },
++  };
++}
++
++function validateSnapshotConsistency(snapshot) {
++  const seen = new Set();
++  for (const task of snapshot.tasks) {
++    if (seen.has(task.number)) {
++      throw new RecoveryError(`duplicate task ${task.number}`, {
++        status: 'contradictory',
++        blockers: [`duplicate-task:${task.number}`],
++      });
++    }
++    seen.add(task.number);
++    const open = snapshot.findings.filter((finding) => finding.task === task.number && finding.status === 'open');
++    if (task.state === 'complete' && open.length > 0) {
++      throw new RecoveryError(`completed task ${task.number} still has open findings`, {
++        status: 'contradictory',
++        blockers: [`complete-with-open-findings:${task.number}`],
++      });
++    }
++    if (snapshot.workflow === 'sdd' && task.state === 'complete' && (task.phase !== 'complete' || task.round !== null)) {
++      throw new RecoveryError(`completed task ${task.number} has unfinished required review`, {
++        status: 'contradictory',
++        blockers: [`complete-unfinished-review:${task.number}`],
++      });
++    }
++  }
++  if (snapshot.current.task !== null) {
++    const currentTask = snapshot.tasks.find((task) => task.number === snapshot.current.task);
++    if (!currentTask) {
++      throw new RecoveryError('current.task is not in the snapshot task mapping', {
++        status: 'contradictory',
++        blockers: ['current-task-missing'],
++      });
++    }
++    if (currentTask.state !== 'complete' && currentTask.phase !== snapshot.current.phase) {
++      throw new RecoveryError('current.phase does not match the current task', {
++        status: 'contradictory',
++        blockers: ['current-phase-mismatch'],
++      });
++    }
++    if (currentTask.state === 'fix' && snapshot.current.round !== currentTask.round) {
++      throw new RecoveryError('current.round does not match the current fix round', {
++        status: 'contradictory',
++        blockers: ['current-round-mismatch'],
++      });
++    }
++  }
++}
++
++export function normalizeSnapshot(raw, identity, parsedPlan) {
++  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
++    throw new RecoveryError('snapshot must be an object', {
++      status: 'unsupported',
++      blockers: ['snapshot-not-object'],
++    });
++  }
++  if (raw.version !== SNAPSHOT_VERSION) {
++    throw new RecoveryError('unsupported snapshot version', {
++      status: 'unsupported',
++      blockers: ['unsupported-snapshot-version'],
++    });
++  }
++  if (!raw.plan || raw.plan.relativePath !== identity.relativePath) {
++    throw new RecoveryError('snapshot plan identity does not match the requested plan', {
++      status: 'contradictory',
++      blockers: ['plan-identity-mismatch'],
++    });
++  }
++  if (!WORKFLOW_VALUES.includes(raw.workflow)) {
++    throw new RecoveryError('unsupported workflow', {
++      status: 'unsupported',
++      blockers: ['unsupported-workflow'],
++    });
++  }
++  if (!raw.execution || !EXECUTION_PROVIDERS.includes(raw.execution.provider)) {
++    throw new RecoveryError('unsupported execution provider', {
++      status: 'unsupported',
++      blockers: ['unsupported-execution-provider'],
++    });
++  }
++  if (!['landed', 'pull_request'].includes(raw.execution.completion)) {
++    throw new RecoveryError('execution.completion is unsupported', {
++      status: 'unsupported',
++      blockers: ['invalid-execution-completion'],
++    });
++  }
++  const titles = new Map(parsedPlan.tasks.map((task) => [task.number, task.title]));
++  const tasks = requiredArray(raw.tasks, 'tasks').map((task, index) => normalizeTask(task, index, titles));
++  if (tasks.length !== parsedPlan.tasks.length) {
++    throw new RecoveryError('snapshot tasks do not match the plan', {
++      status: 'contradictory',
++      blockers: ['task-mapping-mismatch'],
++    });
++  }
++  for (let index = 0; index < parsedPlan.tasks.length; index += 1) {
++    if (tasks[index].number !== parsedPlan.tasks[index].number) {
++      throw new RecoveryError('snapshot task numbers do not match the plan', {
++        status: 'contradictory',
++        blockers: ['task-number-mismatch'],
++      });
++    }
++  }
++  if (!raw.current || typeof raw.current !== 'object') {
++    throw new RecoveryError('current must be an object', {
++      status: 'unsupported',
++      blockers: ['missing-current'],
++    });
++  }
++  const snapshot = {
++    version: SNAPSHOT_VERSION,
++    plan: {
++      relativePath: identity.relativePath,
++      sha256: requiredString(raw.plan.sha256, 'plan.sha256'),
++    },
++    workflow: raw.workflow,
++    execution: {
++      provider: raw.execution.provider,
++      ...(raw.execution.provider === 'kata'
++        ? { project: requiredString(raw.execution.project, 'execution.project') }
++        : {}),
++      completion: raw.execution.completion,
++    },
++    revision: requiredInteger(raw.revision, 'revision', { min: 1 }),
++    current: {
++      task: requiredInteger(raw.current.task, 'current.task', { allowNull: true, min: 1 }),
++      phase: requiredString(raw.current.phase, 'current.phase'),
++      round: requiredInteger(raw.current.round, 'current.round', { allowNull: true, min: 1 }),
++      nextAction: requiredString(raw.current.nextAction, 'current.nextAction'),
++    },
++    tasks,
++    findings: requiredArray(raw.findings, 'findings').map(normalizeFinding),
++    decisions: requiredArray(raw.decisions, 'decisions').map(normalizeDecision),
++    rejectedApproaches: requiredArray(raw.rejectedApproaches, 'rejectedApproaches').map(normalizeRejected),
++    evidence: requiredArray(raw.evidence, 'evidence').map((item, index) =>
++      normalizeFileEvidence(item, `evidence[${index}]`),
++    ),
++    claims: requiredArray(raw.claims, 'claims').map((item, index) => normalizeClaim(item, `claims[${index}]`)),
++    todos: raw.todos === null ? null : requiredArray(raw.todos, 'todos').map(normalizeTodo),
++  };
++  validateSnapshotConsistency(snapshot);
++  return snapshot;
++}
++
++export function parseProgressFile(markdown) {
++  if (typeof markdown !== 'string') return { kind: 'missing' };
++  const trimmed = markdown.replace(/^\uFEFF/, '');
++  if (trimmed.startsWith('# SDD ledger — plan:')) {
++    return { kind: 'legacy', markdown: trimmed };
++  }
++  if (!trimmed.startsWith(SNAPSHOT_MARKER)) {
++    return { kind: 'unknown', markdown: trimmed };
++  }
++  const jsonFence = trimmed.slice(SNAPSHOT_MARKER.length).replace(/^\s+/, '');
++  const match = jsonFence.match(/^```json\n([\s\S]*?)\n```/);
++  if (!match) {
++    throw new RecoveryError('snapshot marker is present but JSON fence is missing', {
++      status: 'unsupported',
++      blockers: ['malformed-snapshot'],
++    });
++  }
++  let raw;
++  try {
++    raw = JSON.parse(match[1]);
++  } catch (error) {
++    throw new RecoveryError(`snapshot JSON is invalid: ${error.message}`, {
++      status: 'unsupported',
++      blockers: ['invalid-snapshot-json'],
++    });
++  }
++  return { kind: 'snapshot', raw, markdown: trimmed };
++}
++
++function renderList(title, items, line) {
++  const rows = items.length === 0 ? ['- none'] : items.map(line);
++  return [`## ${title}`, ...rows].join('\n');
++}
++
++export function renderProgress(snapshot) {
++  const body = JSON.stringify(snapshot, null, 2);
++  const tasks = snapshot.tasks.map((task) => {
++    const round = task.round === null ? '' : ` · round ${task.round}/5`;
++    const next = task.nextAction ? ` — ${task.nextAction}` : '';
++    return `- Task ${task.number} ${task.title}: ${task.state} · ${task.phase}${round}${next}`;
++  });
++  const human = [
++    `# Recovery — \`${snapshot.plan.relativePath}\``,
++    '',
++    `Workflow: ${snapshot.workflow} · execution: ${snapshot.execution.provider} · revision: ${snapshot.revision}`,
++    '',
++    '## Current',
++    `- Task: ${snapshot.current.task === null ? 'none' : snapshot.current.task}`,
++    `- Phase: ${snapshot.current.phase}`,
++    `- Round: ${snapshot.current.round === null ? 'none' : `${snapshot.current.round}/5`}`,
++    `- Next: ${snapshot.current.nextAction}`,
++    '',
++    '## Tasks',
++    ...tasks,
++    '',
++    renderList('Findings', snapshot.findings, (finding) =>
++      `- T${finding.task} ${finding.status}: ${finding.summary}`,
++    ),
++    '',
++    renderList('Decisions', snapshot.decisions, (decision) =>
++      `- ${decision.sourceText ?? `${decision.summary} — ${decision.rationale}`}`,
++    ),
++    '',
++    renderList('Rejected approaches', snapshot.rejectedApproaches, (item) =>
++      `- ${item.summary} — ${item.reason}`,
++    ),
++    '',
++    renderList('Evidence', snapshot.evidence, (item) =>
++      `- ${item.path} (${item.byteLength} bytes, sha256 ${item.sha256})`,
++    ),
++    '',
++    renderList('Claims', snapshot.claims, (claim) =>
++      `- ${claim.ref}${claim.task === null ? '' : ` · task ${claim.task}`}${claim.observedRevision === null ? '' : ` · rev ${claim.observedRevision}`}`,
++    ),
++  ];
++  if (snapshot.todos) {
++    human.push(
++      '',
++      renderList('Todos', snapshot.todos, (todo) => `- ${todo.status}: ${todo.content}`),
++    );
++  }
++  return `${SNAPSHOT_MARKER}\n\`\`\`json\n${body}\n\`\`\`\n\n${human.join('\n')}\n`;
++}
++
++export async function writeProgress(identity, snapshot, { expectedRevision } = {}) {
++  if (expectedRevision !== snapshot.revision) {
++    throw new RecoveryError('publication revision does not match the expected revision', {
++      status: 'attention',
++      blockers: ['revision-mismatch'],
++    });
++  }
++  await ensureWorkspace(identity);
++  const existing = await readProgress(identity);
++  if (existing.kind === 'snapshot') {
++    const currentRevision = existing.raw?.revision;
++    if (currentRevision !== expectedRevision - 1) {
++      throw new RecoveryError('refusing to publish over an unexpected snapshot revision', {
++        status: 'attention',
++        blockers: [`unexpected-revision:${currentRevision}:${expectedRevision}`],
++      });
++    }
++  } else if (expectedRevision !== 1) {
++    throw new RecoveryError('first publication requires revision 1 and explicit enrollment', {
++      status: 'attention',
++      blockers: ['expected-revision-not-initial'],
++    });
++  }
++
++  const markdown = renderProgress(snapshot);
++  const snapshotEvidence = await retainBytes(identity, `snapshot-r${snapshot.revision}.md`, Buffer.from(markdown, 'utf8'));
++  const target = identity.progressPath;
++  await rejectSymlink(target, 'progress.md');
++  const tmp = join(identity.workspace, 'progress.md.tmp');
++  // Acquisition is outside the cleanup region: losing this race never grants
++  // permission to unlink the other publisher's file.
++  let fh = await openExclusive(tmp);
++  let ownsTemp = true;
++  try {
++    await fh.writeFile(markdown);
++    await fh.sync();
++    await fh.close();
++    fh = null;
++    const raced = await readProgress(identity);
++    if (raced.kind !== existing.kind || raced.markdown !== existing.markdown) {
++      throw new RecoveryError('refusing to publish over a raced snapshot', {
++        status: 'attention',
++        blockers: ['publication-conflict'],
++      });
++    }
++    await rename(tmp, target);
++    ownsTemp = false;
++    await syncDirectory(identity.workspace);
++  } catch (error) {
++    if (ownsTemp) await unlink(tmp).catch(() => {});
++    throw error instanceof RecoveryError
++      ? error
++      : new RecoveryError(`snapshot publication failed: ${error.message}`, {
++        status: 'attention',
++        blockers: ['publication-failed'],
++      });
++  } finally {
++    if (fh) await fh.close();
++  }
++
++  return {
++    path: target,
++    markdown,
++    snapshot,
++    snapshotEvidence,
++    eventId: eventIdFor(identity.planKey, snapshot.revision),
++    revision: snapshot.revision,
++  };
++}
++
++export async function readProgress(identity) {
++  try {
++    await rejectSymlink(identity.progressPath, 'progress.md');
++    const markdown = await readFile(identity.progressPath, 'utf8');
++    return parseProgressFile(markdown);
++  } catch (error) {
++    if (error.code === 'ENOENT') return { kind: 'missing' };
++    throw error;
++  }
++}
++
++export function emptyTasks(parsedPlan, phase) {
++  return parsedPlan.tasks.map((task) => ({
++    number: task.number,
++    title: task.title,
++    state: 'pending',
++    phase,
++    round: null,
++    nextAction: null,
++    brief: null,
++    report: null,
++    reviewPackage: null,
++    claim: null,
++    commits: { base: null, head: null },
++  }));
++}
++
++export function defaultPhase(workflow) {
++  return workflow === 'sdd' ? 'implement' : 'execute';
++}
++
++export function sufficientNoneFacts(snapshot) {
++  return (
++    snapshot.current.task !== null
++    && typeof snapshot.current.phase === 'string'
++    && snapshot.current.phase !== ''
++    && typeof snapshot.current.nextAction === 'string'
++    && snapshot.current.nextAction !== ''
++    && snapshot.tasks.length > 0
++    && snapshot.tasks.every((task) => typeof task.state === 'string' && task.state !== '')
++  );
++}
++
++export function collectSnapshotEvidence(snapshot) {
++  const items = [...snapshot.evidence];
++  for (const task of snapshot.tasks) {
++    for (const field of ['brief', 'report', 'reviewPackage']) {
++      if (task[field]) items.push(task[field]);
++    }
++  }
++  for (const finding of snapshot.findings) items.push(...finding.evidence);
++  for (const decision of snapshot.decisions) items.push(...decision.evidence);
++  for (const rejected of snapshot.rejectedApproaches) items.push(...rejected.evidence);
++  return items;
++}
++
++export async function retainSnapshotEvidence(identity, snapshot, plannedWrites = new Map()) {
++  const key = (ref) => `${ref.path}\0${ref.byteLength}\0${ref.sha256}`;
++  const inputs = new Map();
++  for (const ref of collectSnapshotEvidence(snapshot)) {
++    if (!ref || inputs.has(key(ref))) continue;
++    const absolutePath = resolve(identity.root, ref.path);
++    const bytes = plannedWrites.get(absolutePath) ?? await readFile(absolutePath);
++    const prefix = bytes.subarray(0, ref.byteLength);
++    if (bytes.byteLength < ref.byteLength || digestBytes(prefix).sha256 !== ref.sha256) {
++      throw new RecoveryError(`evidence bytes changed: ${ref.path}`, {
++        status: 'attention',
++        blockers: [`evidence-changed:${ref.path}`],
++      });
++    }
++    inputs.set(key(ref), { ref, absolutePath, bytes: prefix });
++  }
++
++  const replacements = new Map();
++  for (const [id, input] of inputs) {
++    const { ref, absolutePath, bytes } = input;
++    if (dirname(absolutePath) === identity.retainedDir && basename(absolutePath).startsWith(`${ref.sha256}-`)) {
++      await rejectSymlink(absolutePath, 'retained evidence');
++      await syncHandle(absolutePath, 'r');
++      replacements.set(id, { ...ref, path: absolutePath });
++    } else {
++      replacements.set(id, await retainBytes(identity, basename(absolutePath), bytes));
++    }
++  }
++  if (replacements.size > 0) await syncDirectory(identity.retainedDir);
++  const replace = (ref) => ref === null ? null : replacements.get(key(ref));
++  const replaceEvidence = (items) => items.map(replace);
++  const retained = [...replacements.values()];
++  return {
++    retained,
++    snapshot: {
++      ...snapshot,
++      evidence: replaceEvidence(snapshot.evidence),
++      tasks: snapshot.tasks.map((task) => ({
++        ...task,
++        brief: replace(task.brief),
++        report: replace(task.report),
++        reviewPackage: replace(task.reviewPackage),
++      })),
++      findings: snapshot.findings.map((item) => ({ ...item, evidence: replaceEvidence(item.evidence) })),
++      decisions: snapshot.decisions.map((item) => ({ ...item, evidence: replaceEvidence(item.evidence) })),
++      rejectedApproaches: snapshot.rejectedApproaches.map((item) => ({ ...item, evidence: replaceEvidence(item.evidence) })),
++    },
++  };
++}
++
++export function metadataValue(metadata, key) {
++  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
++  const value = metadata[key];
++  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
++    return String(value);
++  }
++  return null;
++}
++
++export function labelNames(payload) {
++  if (!Array.isArray(payload?.labels)) return [];
++  return payload.labels
++    .map((item) => (typeof item === 'string' ? item : item?.label))
++    .filter((item) => typeof item === 'string' && item !== '');
++}
++
++export function observeKataShow(payload, { project, relativePath, task, ref }) {
++  const blockers = [];
++  const issue = payload?.issue;
++  if (!issue || typeof issue !== 'object' || Array.isArray(issue)) {
++    return { observation: null, blockers: [`kata-show-missing-issue:${ref}`] };
++  }
++  if (!Number.isInteger(issue.revision)) {
++    blockers.push(`kata-revision-missing:${ref}`);
++  }
++  const status = issue.status;
++  if (status !== 'open' && status !== 'closed') {
++    blockers.push(`kata-status-unknown:${ref}`);
++  }
++  const shortId = issue.short_id;
++  if (typeof shortId !== 'string' || shortId === '') {
++    blockers.push(`kata-short-id-missing:${ref}`);
++  }
++  const expectedShort = typeof ref === 'string' && ref.includes('#') ? ref.slice(ref.indexOf('#') + 1) : ref;
++  if (shortId !== expectedShort) {
++    blockers.push(`kata-short-id-mismatch:${ref}`);
++  }
++  const qualified = `${project}#${shortId}`;
++  if (ref !== qualified && ref !== shortId) {
++    blockers.push(`kata-ref-project-mismatch:${ref}:${project}`);
++  }
++  const planMeta = metadataValue(issue.metadata, 'sjujperpowers.plan');
++  if (planMeta !== relativePath) {
++    blockers.push(`kata-plan-metadata-mismatch:${ref}`);
++  }
++  const taskMeta = metadataValue(issue.metadata, 'sjujperpowers.task');
++  if (task !== null && task !== undefined && taskMeta !== String(task)) {
++    blockers.push(`kata-task-metadata-mismatch:${ref}`);
++  }
++  const labels = labelNames(payload);
++  if (task !== null && task !== undefined && !labels.includes('sjujperpowers-task')) {
++    blockers.push(`kata-label-missing:${ref}`);
++  }
++  const leaseSource = payload.lease ?? null;
++  const observation = {
++    kind: 'provider',
++    provider: 'kata',
++    ref: typeof shortId === 'string' ? `${project}#${shortId}` : ref,
++    uid: typeof issue.uid === 'string' ? issue.uid : null,
++    project,
++    shortId: typeof shortId === 'string' ? shortId : null,
++    observedRevision: Number.isInteger(issue.revision) ? issue.revision : null,
++    status: status === 'open' || status === 'closed' ? status : 'unknown',
++    task: task ?? null,
++
++    labels,
++    owner: typeof issue.owner === 'string' ? issue.owner : null,
++    lease: leaseSource && typeof leaseSource === 'object'
++      ? {
++        holder: typeof leaseSource.holder === 'string' ? leaseSource.holder : null,
++        holderInstanceUid: typeof leaseSource.holder_instance_uid === 'string'
++          ? leaseSource.holder_instance_uid
++          : null,
++        claimKind: typeof leaseSource.claim_kind === 'string' ? leaseSource.claim_kind : null,
++        claimUid: typeof leaseSource.claim_uid === 'string' ? leaseSource.claim_uid : null,
++        revision: Number.isInteger(leaseSource.revision) ? leaseSource.revision : null,
++        expiresAt: typeof leaseSource.expires_at === 'string' ? leaseSource.expires_at : null,
++        releasedAt: typeof leaseSource.released_at === 'string' ? leaseSource.released_at : null,
++      }
++      : null,
++  };
++  return { observation, blockers, status: status === 'open' || status === 'closed' ? status : 'unknown' };
++}
++
++function nonEmptyString(value) {
++  return typeof value === 'string' && value !== '' ? value : null;
++}
++
++function leaseHeld(lease, hubNow = null) {
++  if (!lease || typeof lease !== 'object') return false;
++  if (nonEmptyString(lease.releasedAt)) return false;
++  const expiresAt = nonEmptyString(lease.expiresAt);
++  const hub = nonEmptyString(hubNow);
++  if (expiresAt && hub) {
++    const exp = Date.parse(expiresAt);
++    const now = Date.parse(hub);
++    if (Number.isFinite(exp) && Number.isFinite(now) && now >= exp) return false;
++  }
++  return Boolean(nonEmptyString(lease.holder) || nonEmptyString(lease.claimUid));
++}
++
++function priorLeaseRequired(claim) {
++  return leaseHeld(claim?.lease ?? null);
++}
++
++function authorityBlockers(recorded, live, hubNow, ref) {
++  const blockers = [];
++  const recordedOwner = nonEmptyString(recorded?.owner);
++  const liveOwner = nonEmptyString(live?.owner);
++  if (recordedOwner && liveOwner !== recordedOwner) {
++    blockers.push(`kata-owner-changed:${ref}`);
++  }
++
++  const recordedLease = recorded?.lease ?? null;
++  if (!priorLeaseRequired(recorded)) return blockers;
++
++  const liveLease = live?.lease ?? null;
++  const liveExpiresAt = nonEmptyString(liveLease?.expiresAt);
++  const hub = nonEmptyString(hubNow);
++  const liveExpired = Boolean(
++    liveLease
++    && !nonEmptyString(liveLease.releasedAt)
++    && liveExpiresAt
++    && hub
++    && Number.isFinite(Date.parse(liveExpiresAt))
++    && Number.isFinite(Date.parse(hub))
++    && Date.parse(hub) >= Date.parse(liveExpiresAt),
++  );
++  if (!leaseHeld(liveLease, hubNow)) {
++    blockers.push(liveExpired ? `kata-lease-expired:${ref}` : `kata-lease-released:${ref}`);
++    return blockers;
++  }
++
++  const sameClaim = Boolean(
++    nonEmptyString(recordedLease?.claimUid)
++    && recordedLease.claimUid === liveLease.claimUid,
++  );
++  const sameHolder = Boolean(
++    nonEmptyString(recordedLease?.holder)
++    && recordedLease.holder === liveLease.holder,
++  );
++  if (sameClaim && sameHolder) return blockers;
++  if (
++    nonEmptyString(recordedLease?.holder)
++    && nonEmptyString(liveLease?.holder)
++    && recordedLease.holder !== liveLease.holder
++  ) {
++    blockers.push(`kata-lease-foreign:${ref}`);
++    return blockers;
++  }
++  blockers.push(`kata-lease-replaced:${ref}`);
++  return blockers;
++}
++
++export async function reconcileKata({
++  snapshot,
++  identity,
++  execution,
++  showIssue,
++  root,
++  overlayStates = false,
++}) {
++  const blockers = [];
++  const tasks = snapshot.tasks.map((task) => ({ ...task, commits: { ...task.commits } }));
++  if (execution.provider !== 'kata') {
++    return { tasks, claims: snapshot.claims, blockers };
++  }
++  if (snapshot.execution.provider !== 'kata') blockers.push('execution-provider-mismatch');
++  if (snapshot.execution.project !== execution.project) blockers.push('execution-project-mismatch');
++  if (snapshot.execution.completion !== execution.completion) blockers.push('execution-completion-mismatch');
++  if (typeof showIssue !== 'function') {
++    blockers.push('missing-kata-show');
++    return { tasks, claims: [], blockers };
++  }
++
++  const referenced = [];
++  for (const task of tasks) {
++    if (task.claim) referenced.push({ task: task.number, claim: task.claim });
++    else blockers.push(`missing-task-mapping:${task.number}`);
++  }
++  for (const claim of snapshot.claims) {
++    if (!referenced.some((item) => item.claim.ref === claim.ref && item.task === claim.task)) {
++      referenced.push({ task: claim.task, claim });
++    }
++  }
++
++  const claims = [];
++  for (const item of referenced) {
++    const ref = item.claim.ref;
++    let payload;
++    try {
++      payload = await showIssue({ root, project: execution.project, ref });
++    } catch {
++      blockers.push(`kata-show-failed:${ref}`);
++      continue;
++    }
++    const observed = observeKataShow(payload, {
++      project: execution.project,
++      relativePath: identity.relativePath,
++      task: item.task,
++      ref,
++    });
++    blockers.push(...observed.blockers);
++    if (
++      observed.blockers.length > 0
++      || observed.observation === null
++      || observed.observation.observedRevision === null
++      || observed.observation.status === 'unknown'
++    ) {
++      continue;
++    }
++    const live = observed.observation;
++    blockers.push(...authorityBlockers(
++      item.claim,
++      live,
++      typeof payload?.lease_hub_now === 'string' ? payload.lease_hub_now : null,
++      ref,
++    ));
++    claims.push(live);
++    if (item.task !== null) {
++      const task = tasks.find((entry) => entry.number === item.task);
++      if (task) {
++        task.claim = live;
++        if (overlayStates) {
++          const unfinishedReview = task.state === 'review' || task.state === 'fix'
++            || (task.round !== null && task.state !== 'complete');
++          if (task.state === 'complete' && live.status === 'open') {
++            task.state = 'complete_unlanded';
++          } else if (live.status === 'closed' && (unfinishedReview || task.state !== 'complete')) {
++            task.state = 'contradictory';
++            blockers.push(`closed-child-unfinished-review:task-${task.number}:${ref}`);
++          }
++        }
++      }
++    }
++  }
++  return { tasks, claims, blockers };
++}
++
++async function main(args) {
++  let root = process.cwd();
++  let planPath = null;
++  let mode = null;
++  for (let index = 0; index < args.length; index += 1) {
++    const arg = args[index];
++    const value = args[index + 1];
++    if (arg === '--root') {
++      if (!value) throw new Error('--root requires a directory');
++      root = resolve(value);
++      index += 1;
++    } else if (arg === '--plan') {
++      if (!value) throw new Error('--plan requires a path');
++      planPath = value;
++      index += 1;
++    } else if (arg === '--workspace-path' || arg === '--identity') {
++      mode = arg === '--identity' ? 'identity' : 'workspace';
++    } else {
++      throw new Error(`unknown argument: ${arg}`);
++    }
++  }
++  if (planPath === null) throw new Error('--plan is required');
++  if (mode === null) throw new Error('--workspace-path or --identity is required');
++  const identity = await resolvePlanIdentity(root, planPath);
++  if (mode === 'workspace') {
++    process.stdout.write(`${identity.workspace}\n`);
++    return;
++  }
++  process.stdout.write(`${JSON.stringify({
++    root: identity.root,
++    relativePath: identity.relativePath,
++    planKey: identity.planKey,
++    workspace: identity.workspace,
++    sha256: identity.sha256,
++  })}\n`);
++}
++
++if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(resolve(process.argv[1]))) {
++  try {
++    await main(process.argv.slice(2));
++  } catch (error) {
++    process.stderr.write(`${error.message}\n`);
++    process.exitCode = 1;
++  }
++}
+diff --git a/tests/claude-code/test-sdd-workspace.sh b/tests/claude-code/test-sdd-workspace.sh
+index f520555cf2..00fede88d1 100755
+--- a/tests/claude-code/test-sdd-workspace.sh
++++ b/tests/claude-code/test-sdd-workspace.sh
+@@ -79,17 +79,19 @@
+     fi
+ 
+     # --- per-plan resolution ---
+-    local dir_a dir_b
++    local dir_a dir_b key_a
+     dir_a="$(cd "$repo" && "$SDD_SCRIPTS/sdd-workspace" plan-a.md)"
+     dir_b="$(cd "$repo" && "$SDD_SCRIPTS/sdd-workspace" plan-b.md)"
++    key_a="$(node --input-type=module -e 'import { createHash } from "node:crypto"; process.stdout.write(createHash("sha256").update("plan-a.md").digest("hex"))')"
+ 
+-    if [[ "$dir_a" == "$repo/.sjujperpowers/sdd/plan-a" ]]; then
+-        pass "prints <repo-root>/.sjujperpowers/sdd/<plan-basename>"
++    if [[ "$dir_a" == "$repo/.sjujperpowers/sdd/$key_a" ]]; then
++        pass "prints <repo-root>/.sjujperpowers/sdd/<plan-key>"
+     else
+-        fail "prints <repo-root>/.sjujperpowers/sdd/<plan-basename>"
++        fail "prints <repo-root>/.sjujperpowers/sdd/<plan-key>"
+         echo "    got: $dir_a"
+     fi
+ 
++
+     if [[ "$dir_a" != "$dir_b" && -d "$dir_a" && -d "$dir_b" ]]; then
+         pass "two plans resolve to two distinct directories"
+     else
+@@ -129,13 +131,14 @@
+     local brief_out brief_path
+     brief_out="$(cd "$repo" && "$SDD_SCRIPTS/task-brief" plan-a.md 1)"
+     brief_path="$(printf '%s\n' "$brief_out" | sed -n 's/^wrote \(.*\): [0-9][0-9]* lines$/\1/p')"
+-    if [[ "$brief_path" == "$repo/.sjujperpowers/sdd/plan-a/task-1-brief.md" ]]; then
++    if [[ "$brief_path" == "$repo/.sjujperpowers/sdd/$key_a/task-1-brief.md" ]]; then
+         pass "task-brief writes its brief under the plan's workspace"
+     else
+         fail "task-brief writes its brief under the plan's workspace"
+         echo "    got: $brief_path"
+     fi
+ 
++
+     # --- review-package takes the plan first and lands in its directory ---
+     ( cd "$repo" \
+         && printf 'y\n' > f \
+@@ -148,7 +151,7 @@
+     rp_out="$(cd "$repo" && "$SDD_SCRIPTS/review-package" plan-a.md "$base" "$head")"
+     rp_path="$(printf '%s\n' "$rp_out" | sed -n 's/^wrote \(.*\): [0-9].*$/\1/p')"
+     case "$rp_path" in
+-        "$repo/.sjujperpowers/sdd/plan-a/review-"*.diff)
++        "$repo/.sjujperpowers/sdd/$key_a/review-"*.diff)
+             pass "review-package writes its diff under the plan's workspace" ;;
+         *)
+             fail "review-package writes its diff under the plan's workspace"
+@@ -183,7 +186,7 @@
+     local wt_root wt_dir
+     wt_root="$(cd "$wt" && jj root)"
+     wt_dir="$(cd "$wt" && "$SDD_SCRIPTS/sdd-workspace" plan-a.md)"
+-    if [[ "$wt_dir" == "$wt_root/.sjujperpowers/sdd/plan-a" && "$wt_dir" != "$dir_a" ]]; then
++    if [[ "$wt_dir" == "$wt_root/.sjujperpowers/sdd/$key_a" && "$wt_dir" != "$dir_a" ]]; then
+         pass "linked workspace resolves its own distinct workspace"
+     else
+         fail "linked workspace resolves its own distinct workspace"
+@@ -191,6 +194,7 @@
+         echo "    wt:   $wt_dir"
+     fi
+ 
++
+     printf 'y\n' > "$wt_dir/artifact.md"
+     local wt_status
+     wt_status="$(cd "$wt" && jj status)"
+diff --git a/tests/omp/test-omp-extension.mjs b/tests/omp/test-omp-extension.mjs
+index 9bb8ce6527..5ff2f1fe74 100644
+--- a/tests/omp/test-omp-extension.mjs
++++ b/tests/omp/test-omp-extension.mjs
+@@ -13,15 +13,19 @@
+ 
+ async function loadExtension() {
+   const handlers = new Map();
++  const workflows = [];
+   const omp = {
+     on(event, handler) {
+       if (!handlers.has(event)) handlers.set(event, []);
+       handlers.get(event).push(handler);
+     },
++    registerContinuationWorkflow(registration) {
++      workflows.push(registration);
++    },
+   };
+   const mod = await import(pathToFileURL(extensionPath).href + `?cachebust=${Date.now()}-${Math.random()}`);
+   mod.default(omp);
+-  return handlers;
++  return { handlers, workflows };
+ }
+ 
+ test('package declares a separate OMP extension', async () => {
+@@ -34,7 +38,11 @@
+ });
+ 
+ test('OMP extension discovers skills and prompts once for missing backend configuration', async t => {
+-  const handlers = await loadExtension();
++  const { handlers, workflows } = await loadExtension();
++
++  assert.equal(workflows.length, 1);
++  assert.equal(workflows[0].id, 'sjujperpowers');
++  assert.equal(typeof workflows[0].exportProjection, 'function');
+ 
+   assert.deepEqual(
+     [...handlers.keys()],
+diff --git a/tests/tracking-providers/test-recovery.mjs b/tests/tracking-providers/test-recovery.mjs
+new file mode 100644
+index 0000000000..6bd9910c3c
+--- /dev/null
++++ b/tests/tracking-providers/test-recovery.mjs
+@@ -0,0 +1,1216 @@
++import assert from 'node:assert/strict';
++import { createHash } from 'node:crypto';
++import { mkdtemp, mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { dirname, join } from 'node:path';
++import test from 'node:test';
++
++import { exportRecovery } from '../../skills/tracking-providers/scripts/export-recovery.mjs';
++import { migrateRecovery, parseLegacyLedger } from '../../skills/tracking-providers/scripts/migrate-recovery.mjs';
++import {
++  extractGlobalConstraints,
++  extractTaskBody,
++  parsePlan,
++} from '../../skills/tracking-providers/scripts/materialize-plan.mjs';
++import {
++  normalizeSnapshot,
++  planKey,
++  resolvePlanIdentity,
++} from '../../skills/tracking-providers/scripts/recovery-lib.mjs';
++import { recordRecovery } from '../../skills/tracking-providers/scripts/record-recovery.mjs';
++
++const PLAN = `# Recovery Fixture Implementation Plan
++
++**Spec:** \`docs/project/specs/example.md\`
++
++**Source:** plane:AGENT-12
++
++## Global Constraints
++
++- Do not publish protected configuration
++- Preserve exact review rounds
++
++---
++
++### Task 1: First
++
++First body with token ALPHA.
++
++### Task 2: Second
++
++Second body with token BRAVO.
++
++### Task 3: Third
++
++Third body with token CHARLIE.
++`;
++
++function sha256(text) {
++  return createHash('sha256').update(text, 'utf8').digest('hex');
++}
++
++function sessionConfig() {
++  return {
++    version: 1,
++    configPath: '/fixture/.sjujperpowers/config.json',
++    docsRoot: 'docs/project',
++    roadmap: { provider: 'file' },
++    execution: { provider: 'session', completion: 'landed' },
++  };
++}
++
++function noneConfig() {
++  return {
++    ...sessionConfig(),
++    execution: { provider: 'none', completion: 'landed' },
++  };
++}
++
++function kataConfig() {
++  return {
++    version: 1,
++    configPath: '/fixture/.sjujperpowers/config.json',
++    docsRoot: 'docs/project',
++    roadmap: { provider: 'file' },
++    execution: { provider: 'kata', project: 'sjujperpowers', completion: 'landed' },
++  };
++}
++
++function kataIssue({
++  shortId,
++  task,
++  status = 'open',
++  revision = 4,
++  plan = 'docs/project/plans/feature.md',
++  owner = null,
++  lease = null,
++} = {}) {
++  return {
++    issue: {
++      id: task,
++      uid: `uid-${shortId}`,
++      project_id: 1,
++      short_id: shortId,
++      title: `Task ${task}`,
++      body: '',
++      status,
++      owner,
++      author: 'agent',
++      metadata: {
++        'sjujperpowers.plan': plan,
++        'sjujperpowers.task': String(task),
++      },
++      revision,
++      created_at: '2026-09-09T00:00:00Z',
++      updated_at: '2026-09-09T00:00:00Z',
++    },
++    comments: [],
++    links: [],
++    labels: [{ issue_id: task, label: 'sjujperpowers-task', author: 'agent' }],
++    lease,
++    pending_leases: [],
++    lease_hub_now: null,
++    lease_violations: [],
++  };
++}
++
++function taskClaims() {
++  return [1, 2, 3].map((task) => ({
++    kind: 'provider',
++    provider: 'kata',
++    ref: `sjujperpowers#t${task}`,
++    observedRevision: null,
++    task,
++  }));
++}
++
++function fakeShow(issues, calls) {
++  return async ({ ref }) => {
++    calls.push(['show', ref]);
++    if (!issues[ref]) throw new Error(`missing ${ref}`);
++    return issues[ref];
++  };
++}
++
++function showTasks(overrides = {}, calls = []) {
++  const issues = {
++    'sjujperpowers#t1': kataIssue({ shortId: 't1', task: 1, ...(overrides.t1 ?? {}) }),
++    'sjujperpowers#t2': kataIssue({ shortId: 't2', task: 2, ...(overrides.t2 ?? {}) }),
++    'sjujperpowers#t3': kataIssue({ shortId: 't3', task: 3, ...(overrides.t3 ?? {}) }),
++  };
++  return fakeShow(issues, calls);
++}
++
++function assertDefined(value, path = 'root') {
++  assert.notEqual(value, undefined, `${path} must not be undefined`);
++  if (Array.isArray(value)) {
++    value.forEach((item, index) => assertDefined(item, `${path}[${index}]`));
++    return;
++  }
++  if (value && typeof value === 'object') {
++    for (const [key, child] of Object.entries(value)) {
++      assertDefined(child, `${path}.${key}`);
++    }
++  }
++}
++
++async function fixture(planRelative = 'docs/project/plans/feature.md', markdown = PLAN) {
++  const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-recovery-'));
++  const planPath = join(root, planRelative);
++  await mkdir(dirname(planPath), { recursive: true });
++  await writeFile(planPath, markdown);
++  const identity = await resolvePlanIdentity(root, planPath);
++  return { root: identity.root, planPath: identity.planPath, identity, planRelative };
++}
++
++test('extractGlobalConstraints and extractTaskBody reuse the plan parser', () => {
++  assert.deepEqual(parsePlan(PLAN).tasks.map((task) => task.title), ['First', 'Second', 'Third']);
++  assert.deepEqual(extractGlobalConstraints(PLAN), [
++    '- Do not publish protected configuration',
++    '- Preserve exact review rounds',
++  ]);
++  const brief = extractTaskBody(PLAN, 2);
++  assert.match(brief, /Second body with token BRAVO/);
++  assert.doesNotMatch(brief, /Global Constraints/);
++});
++
++test('fix rounds, rejected approaches, and exact evidence survive export', async () => {
++  const { root, planPath, identity } = await fixture();
++  const reportPath = join(identity.workspace, 'task-2-report.md');
++  const report = 'open finding: missing progress reporting\n';
++  const recorded = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      type: 'fix-round',
++      task: 2,
++      round: 2,
++      nextAction: 'resume implementer with open findings',
++      current: { task: 2, phase: 'fix', round: 2, nextAction: 'resume implementer with open findings' },
++      tasks: [
++        { number: 1, state: 'complete', phase: 'complete', round: null },
++        { number: 2, state: 'fix', phase: 'fix', round: 2, nextAction: 'resume implementer with open findings' },
++      ],
++      findings: [{
++        id: 'f1',
++        task: 2,
++        status: 'open',
++        summary: 'missing progress reporting',
++        evidence: [],
++      }],
++      rejectedApproaches: [{
++        id: 'r1',
++        task: 2,
++        summary: 'rewrite the formatter from scratch',
++        reason: 'loses the reviewed Task 1 interface',
++        evidence: [],
++      }],
++      todos: [{ id: 't2', content: 'Task 2', status: 'in_progress' }],
++      writeFiles: [{ path: reportPath, contents: report }],
++    },
++  });
++  assert.equal(recorded.acknowledged, true);
++  assert.equal(recorded.revision, 1);
++  assert.match(recorded.eventId, /:r1$/);
++  assert.equal(recorded.evidence[0].sha256, sha256(report));
++  assert.equal(recorded.snapshotEvidence.kind, 'file');
++
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assertDefined(projection);
++  assert.equal(projection.current.round, 2);
++  assert.equal(projection.rejectedApproaches[0].summary, 'rewrite the formatter from scratch');
++  assert.equal(projection.recovery.status, 'eligible');
++});
++
++test('retained snapshot survives replacement and evidenceRefs keep exact hashes', async () => {
++  const { root, planPath, identity } = await fixture();
++  const archive = join(identity.workspace, 'history.log');
++  const prefix = 'decision: keep the reviewed base\n';
++  await mkdir(identity.workspace, { recursive: true });
++  await writeFile(archive, prefix);
++  const first = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'continue task 1' },
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      evidenceRefs: [{
++        kind: 'file',
++        path: archive,
++        byteLength: Buffer.byteLength(prefix),
++        sha256: sha256(prefix),
++      }],
++    },
++  });
++  await writeFile(archive, `${prefix}later appendix\n`);
++  const second = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      expectedRevision: 2,
++      nextAction: 'continue after retain',
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++    },
++  });
++  assert.equal(second.revision, 2);
++  assert.equal(second.retained.length, 1);
++  assert.equal(second.retained[0].sha256, first.snapshotEvidence.sha256);
++  assert.equal(sha256(await readFile(first.snapshotEvidence.path, 'utf8')), first.snapshotEvidence.sha256);
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.ok(projection.evidence.some((item) => item.sha256 === sha256(prefix)));
++});
++
++test('an unacknowledged current snapshot cannot authorize dependent work', async () => {
++  const { root, planPath } = await fixture();
++  const receipt = await recordRecovery({
++    root, planPath, config: sessionConfig(),
++    event: {
++      workflow: 'inline',
++      current: { task: 1, phase: 'execute', round: null, nextAction: 'continue task 1' },
++      tasks: [{ number: 1, state: 'in_progress', phase: 'execute', round: null }],
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++    },
++  });
++  await unlink(receipt.snapshotEvidence.path);
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.eligible, false);
++  assert.ok(projection.recovery.blockers.includes(`unacknowledged-snapshot:${receipt.revision}`));
++});
++
++test('a losing recorder never removes another publisher temp file', async () => {
++  const { root, planPath, identity } = await fixture();
++  await mkdir(identity.workspace, { recursive: true });
++  const temp = join(identity.workspace, 'progress.md.tmp');
++  await writeFile(temp, 'owned by the other publisher');
++  await assert.rejects(recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'continue task 1' },
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++    },
++  }), /exclusive publication failed/);
++  assert.equal(await readFile(temp, 'utf8'), 'owned by the other publisher');
++  await assert.rejects(readFile(identity.progressPath));
++});
++
++test('same-basename reports keep their own bytes after source files are overwritten', async () => {
++  const { root, planPath, identity } = await fixture();
++  const paths = [join(identity.workspace, 'first/report.txt'), join(identity.workspace, 'second/report.txt')];
++  const texts = ['first task evidence', 'second task evidence'];
++  await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'continue task 1' },
++      tasks: paths.map((path, index) => ({
++        number: index + 1,
++        report: { kind: 'file', path, byteLength: Buffer.byteLength(texts[index]), sha256: sha256(texts[index]) },
++      })),
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      writeFiles: paths.map((path, index) => ({ path, contents: texts[index] })),
++    },
++  });
++  await Promise.all(paths.map((path) => writeFile(path, 'replacement output')));
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.status, 'eligible');
++  assert.deepEqual(
++    await Promise.all(projection.tasks.slice(0, 2).map((task) => readFile(task.report.path, 'utf8'))),
++    texts,
++  );
++});
++
++test('missing task brief regenerates from the acknowledged plan source', async () => {
++  const { root, planPath, identity } = await fixture();
++  const briefText = extractTaskBody(PLAN, 1);
++  const briefPath = join(identity.workspace, 'task-1-brief.md');
++  const recorded = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [{
++        number: 1,
++        state: 'in_progress',
++        phase: 'implement',
++        round: null,
++        brief: {
++          kind: 'file',
++          path: briefPath,
++          byteLength: Buffer.byteLength(briefText),
++          sha256: sha256(briefText),
++        },
++      }],
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      writeFiles: [{ path: briefPath, contents: briefText }],
++    },
++  });
++  assert.equal(recorded.snapshot.tasks[0].brief.kind, 'file');
++  await unlink(recorded.snapshot.tasks[0].brief.path);
++
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.status, 'eligible');
++  assert.equal(projection.recovery.eligible, true);
++  assert.equal(projection.tasks[0].brief.kind, 'regenerated');
++  assert.equal(projection.tasks[0].brief.task, 1);
++  assert.equal(projection.tasks[0].brief.text, briefText);
++  assert.equal(projection.tasks[0].brief.sha256, sha256(briefText));
++  assert.match(projection.tasks[0].brief.text, /token ALPHA/);
++  assert.ok(projection.recovery.capabilities.includes('fresh-handoff'));
++  assert.ok(!projection.evidence.some((item) => item.path === recorded.snapshot.tasks[0].brief.path));
++  assert.ok(!projection.recovery.blockers.some((item) => item.startsWith('missing-review-evidence:')));
++});
++
++test('regenerating a brief cannot replace evidence supporting an open finding', async () => {
++  const { root, planPath, identity } = await fixture();
++  const text = extractTaskBody(PLAN, 1);
++  const briefPath = join(identity.workspace, 'task-1-brief.md');
++  const brief = { kind: 'file', path: briefPath, byteLength: Buffer.byteLength(text), sha256: sha256(text) };
++  const recorded = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [{ number: 1, state: 'in_progress', phase: 'implement', round: null, brief }],
++      findings: [{ id: 'f1', task: 1, status: 'open', summary: 'constraint needs verification', evidence: [brief] }],
++      writeFiles: [{ path: briefPath, contents: text }],
++    },
++  });
++  await unlink(recorded.snapshot.tasks[0].brief.path);
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.tasks[0].brief.kind, 'regenerated');
++  assert.equal(projection.recovery.eligible, false);
++  assert.equal(projection.findings[0].status, 'open');
++  assert.ok(!projection.recovery.capabilities.includes('fresh-handoff'));
++});
++
++test('missing review evidence with active findings stays unresolved', async () => {
++  const { root, planPath, identity } = await fixture();
++  const report = 'reviewer report with open finding\n';
++  const reviewPackage = 'review package for task 2\n';
++  const reportPath = join(identity.workspace, 'task-2-report.md');
++  const reviewPath = join(identity.workspace, 'task-2-review.md');
++  const recorded = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      type: 'fix-round',
++      task: 2,
++      round: 1,
++      current: { task: 2, phase: 'fix', round: 1, nextAction: 'resume fix round 1' },
++      tasks: [
++        { number: 1, state: 'complete', phase: 'complete', round: null },
++        {
++          number: 2,
++          state: 'fix',
++          phase: 'fix',
++          round: 1,
++          nextAction: 'resume fix round 1',
++          report: {
++            kind: 'file',
++            path: reportPath,
++            byteLength: Buffer.byteLength(report),
++            sha256: sha256(report),
++          },
++          reviewPackage: {
++            kind: 'file',
++            path: reviewPath,
++            byteLength: Buffer.byteLength(reviewPackage),
++            sha256: sha256(reviewPackage),
++          },
++        },
++      ],
++      findings: [{
++        id: 'f1',
++        task: 2,
++        status: 'open',
++        summary: 'missing progress reporting',
++        evidence: [],
++      }],
++      todos: [{ id: 't2', content: 'Task 2', status: 'in_progress' }],
++      writeFiles: [
++        { path: reportPath, contents: report },
++        { path: reviewPath, contents: reviewPackage },
++      ],
++    },
++  });
++  await unlink(recorded.snapshot.tasks[1].report.path);
++  await unlink(recorded.snapshot.tasks[1].reviewPackage.path);
++
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.eligible, false);
++  assert.notEqual(projection.recovery.status, 'eligible');
++  assert.ok(projection.recovery.blockers.includes('missing-review-evidence:task-2'));
++  assert.notEqual(projection.tasks[1].state, 'complete');
++  assert.notEqual(projection.tasks[1].state, 'complete_unlanded');
++  assert.ok(!projection.recovery.capabilities.includes('fresh-handoff'));
++  assert.equal(projection.tasks[1].state, 'fix');
++  assert.ok(projection.findings.some((finding) => finding.task === 2 && finding.status === 'open'));
++});
++
++test('changed plan contents cannot reuse or overwrite the acknowledged digest', async () => {
++  const { root, planPath, identity } = await fixture();
++  const oldDigest = identity.sha256;
++  const recorded = await recordRecovery({
++    root,
++    planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [{ number: 1, state: 'in_progress', phase: 'implement', round: null }],
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++    },
++  });
++  const progressBefore = await readFile(identity.progressPath, 'utf8');
++  const snapshotBytes = await readFile(recorded.snapshotEvidence.path);
++  assert.equal(sha256(snapshotBytes), recorded.snapshotEvidence.sha256);
++  assert.match(progressBefore, new RegExp(oldDigest));
++
++  const mutated = PLAN.replace('token ALPHA', 'token MUTATED-ALPHA');
++  await writeFile(planPath, mutated);
++  const reopened = await resolvePlanIdentity(root, planPath);
++  assert.notEqual(reopened.sha256, oldDigest);
++
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.eligible, false);
++  assert.notEqual(projection.recovery.status, 'eligible');
++  assert.ok(projection.recovery.blockers.includes(`plan-digest-changed:${oldDigest}:${reopened.sha256}`));
++  assert.ok(!projection.recovery.capabilities.includes('fresh-handoff'));
++  assert.ok(projection.tasks.every((task) => task.brief?.kind !== 'regenerated'));
++  for (const task of projection.tasks) {
++    if (task.brief?.text) assert.doesNotMatch(task.brief.text, /MUTATED-ALPHA/);
++  }
++  assert.equal(await readFile(identity.progressPath, 'utf8'), progressBefore);
++
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: sessionConfig(),
++      event: {
++        expectedRevision: 2,
++        nextAction: 'continue after plan mutation',
++        todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      },
++    }),
++    (error) => {
++      assert.match(error.message, /plan digest changed/);
++      assert.ok(error.blockers.some((item) => item.startsWith('plan-digest-changed:')));
++      assert.ok(error.blockers.some((item) => item.includes(oldDigest) && item.includes(reopened.sha256)));
++      return true;
++    },
++  );
++
++  assert.equal(await readFile(identity.progressPath, 'utf8'), progressBefore);
++  assert.equal(sha256(await readFile(recorded.snapshotEvidence.path)), recorded.snapshotEvidence.sha256);
++  assert.doesNotMatch(await readFile(identity.progressPath, 'utf8'), /MUTATED-ALPHA/);
++  assert.match(await readFile(identity.progressPath, 'utf8'), new RegExp(oldDigest));
++  assert.doesNotMatch(await readFile(identity.progressPath, 'utf8'), new RegExp(reopened.sha256));
++});
++
++test('same-length mutated evidenceRefs are rejected before write', async () => {
++  const { root, planPath, identity } = await fixture();
++  const archive = join(identity.workspace, 'history.log');
++  await mkdir(identity.workspace, { recursive: true });
++  await writeFile(archive, 'original-bytes-\n');
++  const target = join(identity.workspace, 'should-not-write.md');
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: sessionConfig(),
++      event: {
++        workflow: 'sdd',
++        current: { task: 1, phase: 'implement', round: null, nextAction: 'continue' },
++        todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++        evidenceRefs: [{
++          kind: 'file',
++          path: archive,
++          byteLength: Buffer.byteLength('original-bytes-\n'),
++          sha256: sha256('mutated-bytes--\n'),
++        }],
++        writeFiles: [{ path: target, contents: 'nope' }],
++      },
++    }),
++    /evidence bytes changed/,
++  );
++  await assert.rejects(readFile(target));
++});
++
++test('a complete task remains unlanded until Kata confirms closure', async () => {
++  const { root, planPath } = await fixture();
++  const calls = [];
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { status: 'open', revision: 7 } }, calls),
++    event: {
++      workflow: 'sdd',
++      current: { task: 2, phase: 'implement', round: null, nextAction: 'start task 2' },
++      tasks: [
++        { number: 1, state: 'complete', phase: 'complete', round: null, claim: taskClaims()[0] },
++        { number: 2, claim: taskClaims()[1] },
++        { number: 3, claim: taskClaims()[2] },
++      ],
++      claims: taskClaims(),
++    },
++  });
++  const projection = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { status: 'open', revision: 7 } }, calls),
++  });
++  assert.equal(projection.tasks[0].state, 'complete_unlanded');
++  assert.equal(projection.tasks[0].claim.observedRevision, 7);
++  assert.equal(typeof projection.tasks[0].claim.observedRevision, 'number');
++  assert.equal(projection.recovery.status, 'eligible');
++  assert.ok(calls.every((call) => call[0] === 'show'));
++  const landed = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { status: 'closed', revision: 8 } }),
++  });
++  assert.equal(landed.tasks[0].state, 'complete');
++  assert.equal(landed.tasks[0].claim.status, 'closed');
++  assert.equal(landed.claims.find((claim) => claim.task === 1).status, 'closed');
++  assert.equal(landed.current.task, 2);
++});
++
++test('closed child with unfinished review is contradictory', async () => {
++  const { root, planPath, identity } = await fixture();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t2: { status: 'open', revision: 2 } }),
++    event: {
++      workflow: 'sdd',
++      type: 'fix-round',
++      task: 2,
++      round: 1,
++      current: { task: 2, phase: 'fix', round: 1, nextAction: 'resume fix round 1' },
++      tasks: [
++        { number: 1, claim: taskClaims()[0] },
++        { number: 2, state: 'fix', phase: 'fix', round: 1, claim: taskClaims()[1] },
++        { number: 3, claim: taskClaims()[2] },
++      ],
++      claims: taskClaims(),
++      findings: [{ id: 'f1', task: 2, status: 'open', summary: 'gap', evidence: [] }],
++      writeFiles: [{ path: join(identity.workspace, 'task-2-report.md'), contents: 'report\n' }],
++    },
++  });
++  const projection = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t2: { status: 'closed', revision: 9 } }),
++  });
++  assert.equal(projection.tasks[1].state, 'contradictory');
++  assert.equal(projection.recovery.status, 'contradictory');
++  assert.equal(projection.recovery.eligible, false);
++});
++
++test('failed or unknown Kata observations cannot be eligible or invent revision', async () => {
++  const { root, planPath } = await fixture();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 4 } }),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [
++        { number: 1, state: 'in_progress', phase: 'implement', round: null, claim: taskClaims()[0] },
++        { number: 2, claim: taskClaims()[1] },
++        { number: 3, claim: taskClaims()[2] },
++      ],
++      claims: taskClaims(),
++    },
++  });
++  const failed = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: async ({ ref }) => {
++      if (ref.endsWith('t1')) throw new Error('down');
++      return kataIssue({ shortId: ref.split('#')[1], task: Number(ref.slice(-1)) });
++    },
++  });
++  assert.notEqual(failed.recovery.status, 'eligible');
++  assert.ok(failed.recovery.blockers.some((item) => item.startsWith('kata-show-failed:')));
++  assert.equal(failed.tasks[0].claim?.observedRevision ?? null, null);
++
++  const unknown = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { status: 'weird', revision: 4 } }),
++  });
++  assert.notEqual(unknown.recovery.status, 'eligible');
++  assert.ok(unknown.recovery.blockers.some((item) => item.startsWith('kata-status-unknown:')));
++});
++
++test('Kata lease and integer revision come from the show wire shape', async () => {
++  const { root, planPath } = await fixture();
++  const lease = {
++    claim_uid: 'claim-1',
++    project_id: 1,
++    issue_uid: 'uid-t1',
++    holder: 'agent@host',
++    holder_instance_uid: 'inst-1',
++    client_kind: 'cli',
++    purpose: 'implement',
++    claim_kind: 'hard',
++    acquired_at: '2026-09-09T00:00:00Z',
++    revision: 2,
++    updated_at: '2026-09-09T00:00:00Z',
++  };
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 11, owner: 'owner-a', lease } }),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [
++        { number: 1, state: 'in_progress', phase: 'implement', round: null, claim: taskClaims()[0] },
++        { number: 2, claim: taskClaims()[1] },
++        { number: 3, claim: taskClaims()[2] },
++      ],
++      claims: taskClaims(),
++    },
++  });
++  const projection = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 11, owner: 'owner-a', lease } }),
++  });
++  assert.equal(projection.tasks[0].claim.observedRevision, 11);
++  assert.equal(projection.tasks[0].claim.owner, 'owner-a');
++  assert.equal(projection.tasks[0].claim.lease.holder, 'agent@host');
++  assert.equal(projection.tasks[0].claim.lease.holderInstanceUid, 'inst-1');
++  assert.equal(projection.tasks[0].claim.claimOwner, 'owner-a');
++});
++
++function wireLease(overrides = {}) {
++  return {
++    claim_uid: 'claim-1',
++    project_id: 1,
++    issue_uid: 'uid-t1',
++    holder: 'agent@host',
++    holder_instance_uid: 'inst-1',
++    client_kind: 'cli',
++    purpose: 'implement',
++    claim_kind: 'timed',
++    acquired_at: '2026-09-09T00:00:00Z',
++    revision: 2,
++    expires_at: '2026-09-09T00:30:00Z',
++    updated_at: '2026-09-09T00:00:00Z',
++    ...overrides,
++  };
++}
++
++function kataWorkEvent() {
++  return {
++    workflow: 'sdd',
++    current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++    tasks: [
++      { number: 1, state: 'in_progress', phase: 'implement', round: null, claim: taskClaims()[0] },
++      { number: 2, claim: taskClaims()[1] },
++      { number: 3, claim: taskClaims()[2] },
++    ],
++    claims: taskClaims(),
++  };
++}
++
++test('foreign or released Kata lease cannot silently authorize recovery', async () => {
++  const { root, planPath } = await fixture();
++  const lease = wireLease();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 11, owner: 'owner-a', lease } }),
++    event: kataWorkEvent(),
++  });
++
++  const foreign = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({
++      t1: {
++        revision: 11,
++        owner: 'intruder',
++        lease: wireLease({
++          claim_uid: 'claim-foreign',
++          holder: 'intruder@host',
++          holder_instance_uid: 'inst-foreign',
++          revision: 1,
++        }),
++      },
++    }),
++  });
++  assert.equal(foreign.recovery.eligible, false);
++  assert.notEqual(foreign.recovery.status, 'eligible');
++  assert.ok(foreign.recovery.blockers.some((item) => item.startsWith('kata-lease-foreign:')));
++  assert.ok(foreign.recovery.blockers.some((item) => item.startsWith('kata-owner-changed:')));
++
++  const released = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 11, owner: 'owner-a', lease: null } }),
++  });
++  assert.equal(released.recovery.eligible, false);
++  assert.ok(released.recovery.blockers.some((item) => item.startsWith('kata-lease-released:')));
++
++  const releasedAt = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({
++      t1: {
++        revision: 11,
++        owner: 'owner-a',
++        lease: wireLease({ released_at: '2026-09-09T00:05:00Z' }),
++      },
++    }),
++  });
++  assert.equal(releasedAt.recovery.eligible, false);
++  assert.ok(releasedAt.recovery.blockers.some((item) => item.startsWith('kata-lease-released:')));
++
++  const expired = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: async ({ ref }) => {
++      const payload = await showTasks({
++        t1: { revision: 11, owner: 'owner-a', lease: wireLease({ expires_at: '2026-09-09T00:01:00Z' }) },
++      })({ ref });
++      return { ...payload, lease_hub_now: '2026-09-09T00:31:00Z' };
++    },
++  });
++  assert.equal(expired.recovery.eligible, false);
++  assert.ok(expired.recovery.blockers.some((item) => item.startsWith('kata-lease-expired:')));
++});
++
++test('same-claim lease renewal stays eligible and authorized record can reconcile a new holder', async () => {
++  const { root, planPath } = await fixture();
++  const lease = wireLease();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 11, owner: 'owner-a', lease } }),
++    event: kataWorkEvent(),
++  });
++
++  const renewed = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({
++      t1: { revision: 11, owner: 'owner-a', lease: wireLease({ revision: 3, expires_at: '2026-09-09T01:00:00Z' }) },
++    }),
++  });
++  assert.equal(renewed.recovery.status, 'eligible');
++  assert.equal(renewed.recovery.eligible, true);
++  assert.equal(renewed.tasks[0].claim.lease.claimUid, 'claim-1');
++  assert.equal(renewed.tasks[0].claim.lease.holder, 'agent@host');
++  assert.equal(renewed.tasks[0].claim.lease.revision, 3);
++
++  const foreignShow = showTasks({
++    t1: {
++      revision: 11,
++      owner: 'owner-b',
++      lease: wireLease({
++        claim_uid: 'claim-2',
++        holder: 'owner-b@host',
++        holder_instance_uid: 'inst-2',
++        revision: 1,
++      }),
++    },
++  });
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: kataConfig(),
++      showIssue: foreignShow,
++      event: { expectedRevision: 2, nextAction: 'implement task 1' },
++    }),
++    /failed provider reconciliation/,
++  );
++
++  const blocked = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: foreignShow,
++  });
++  assert.equal(blocked.recovery.eligible, false);
++
++  const acknowledged = await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: foreignShow,
++    event: {
++      expectedRevision: 2,
++      nextAction: blocked.current.nextAction,
++      claims: blocked.claims,
++      tasks: blocked.tasks.map((task) => ({ number: task.number, claim: task.claim })),
++    },
++  });
++  assert.equal(acknowledged.acknowledged, true);
++  const recovered = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: foreignShow,
++  });
++  assert.equal(recovered.recovery.status, 'eligible');
++  assert.equal(recovered.tasks[0].claim.lease.holder, 'owner-b@host');
++  assert.equal(recovered.tasks[0].claim.owner, 'owner-b');
++});
++
++test('unleased local Kata recovery stays eligible when no prior lease was required', async () => {
++  const { root, planPath } = await fixture();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 4 } }),
++    event: kataWorkEvent(),
++  });
++  const projection = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { revision: 4 } }),
++  });
++  assert.equal(projection.recovery.status, 'eligible');
++  assert.equal(projection.tasks[0].claim.lease, null);
++});
++
++test('plan or task metadata mismatch blocks eligibility', async () => {
++  const { root, planPath } = await fixture();
++  await recordRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++      tasks: [
++        { number: 1, state: 'in_progress', phase: 'implement', round: null, claim: taskClaims()[0] },
++        { number: 2, claim: taskClaims()[1] },
++        { number: 3, claim: taskClaims()[2] },
++      ],
++      claims: taskClaims(),
++    },
++  });
++  const projection = await exportRecovery({
++    root,
++    planPath,
++    config: kataConfig(),
++    showIssue: showTasks({ t1: { plan: 'docs/other/plan.md' } }),
++  });
++  assert.notEqual(projection.recovery.status, 'eligible');
++  assert.ok(projection.recovery.blockers.some((item) => item.startsWith('kata-plan-metadata-mismatch:')));
++});
++
++test('missing task mapping cannot make an enrolled Kata run eligible', async () => {
++  const { root, planPath } = await fixture();
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: kataConfig(),
++      showIssue: showTasks(),
++      event: {
++        workflow: 'sdd',
++        current: { task: 1, phase: 'implement', round: null, nextAction: 'implement task 1' },
++        tasks: [{ number: 1, state: 'in_progress', phase: 'implement', round: null }],
++      },
++    }),
++    /failed provider reconciliation|missing Kata mapping/,
++  );
++});
++
++test('inline session eligibility requires persisted todos; none requires explicit facts', async () => {
++  const session = await fixture('docs/project/plans/inline.md');
++  await recordRecovery({
++    root: session.root,
++    planPath: session.planPath,
++    config: sessionConfig(),
++    event: {
++      workflow: 'inline',
++      current: { task: 1, phase: 'execute', round: null, nextAction: 'execute task 1' },
++      tasks: [{ number: 1, state: 'in_progress', phase: 'execute', round: null }],
++    },
++  });
++  const ineligibleSession = await exportRecovery({
++    root: session.root,
++    planPath: session.planPath,
++    config: sessionConfig(),
++  });
++  assert.equal(ineligibleSession.recovery.status, 'ineligible');
++
++  await recordRecovery({
++    root: session.root,
++    planPath: session.planPath,
++    config: sessionConfig(),
++    event: {
++      expectedRevision: 2,
++      todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      nextAction: 'execute task 1',
++    },
++  });
++  const eligibleSession = await exportRecovery({
++    root: session.root,
++    planPath: session.planPath,
++    config: sessionConfig(),
++  });
++  assert.equal(eligibleSession.recovery.status, 'eligible');
++
++  const noneCase = await fixture('docs/project/plans/none.md');
++  const missingFacts = await exportRecovery({
++    root: noneCase.root,
++    planPath: noneCase.planPath,
++    config: noneConfig(),
++  });
++  assert.ok(missingFacts.recovery.blockers.includes('not-enrolled'));
++  await recordRecovery({
++    root: noneCase.root,
++    planPath: noneCase.planPath,
++    config: noneConfig(),
++    event: {
++      workflow: 'inline',
++      current: { task: 2, phase: 'execute', round: null, nextAction: 'resume task 2 from recorded facts' },
++      tasks: [
++        { number: 1, state: 'complete', phase: 'complete', round: null },
++        { number: 2, state: 'in_progress', phase: 'execute', round: null },
++      ],
++    },
++  });
++  const eligibleNone = await exportRecovery({
++    root: noneCase.root,
++    planPath: noneCase.planPath,
++    config: noneConfig(),
++  });
++  assert.equal(eligibleNone.recovery.status, 'eligible');
++});
++
++test('same-basename plans enroll into isolated plan-key workspaces', async () => {
++  const root = await mkdtemp(join(tmpdir(), 'sjujperpowers-recovery-'));
++  const a = join(root, 'docs/a/plan.md');
++  const b = join(root, 'docs/b/plan.md');
++  await mkdir(dirname(a), { recursive: true });
++  await mkdir(dirname(b), { recursive: true });
++  await writeFile(a, PLAN);
++  await writeFile(b, PLAN.replace('First body', 'Other first'));
++  const idA = await resolvePlanIdentity(root, a);
++  const idB = await resolvePlanIdentity(root, b);
++  assert.equal(idA.planKey, planKey('docs/a/plan.md'));
++  assert.notEqual(idA.planKey, idB.planKey);
++  await recordRecovery({
++    root: idA.root,
++    planPath: 'docs/a/plan.md',
++    config: sessionConfig(),
++    event: {
++      workflow: 'sdd',
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'work on A' },
++      todos: [{ id: 'a', content: 'A', status: 'in_progress' }],
++    },
++  });
++  const projA = await exportRecovery({
++    root: idA.root,
++    planPath: 'docs/a/plan.md',
++    config: sessionConfig(),
++  });
++  assert.equal(projA.plan.relativePath, 'docs/a/plan.md');
++});
++
++test('relative plan paths resolve against the supplied root, not cwd', async () => {
++  const { root, identity } = await fixture();
++  const previous = process.cwd();
++  process.chdir(tmpdir());
++  try {
++    const again = await resolvePlanIdentity(root, identity.relativePath);
++    assert.equal(again.relativePath, identity.relativePath);
++    assert.equal(again.planKey, identity.planKey);
++  } finally {
++    process.chdir(previous);
++  }
++});
++
++test('plan file and ancestor symlinks are refused', async () => {
++  const { root, planPath } = await fixture();
++  const alias = join(root, 'alias.md');
++  await symlink(planPath, alias);
++  await assert.rejects(
++    exportRecovery({ root, planPath: alias, config: sessionConfig() }),
++    /symlink/,
++  );
++});
++
++test('incompatible gitignore is not overwritten', async () => {
++  const { root, planPath, identity } = await fixture();
++  await mkdir(join(identity.root, '.sjujperpowers/sdd'), { recursive: true });
++  await writeFile(join(identity.root, '.sjujperpowers/sdd/.gitignore'), 'secret\n');
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: sessionConfig(),
++      event: {
++        workflow: 'sdd',
++        current: { task: 1, phase: 'implement', round: null, nextAction: 'go' },
++        todos: [{ id: 't1', content: 'Task 1', status: 'in_progress' }],
++      },
++    }),
++    /incompatible/,
++  );
++});
++
++test('missing findings array is not silently emptied', async () => {
++  const { identity } = await fixture();
++  const parsed = parsePlan(identity.markdown);
++  assert.throws(
++    () => normalizeSnapshot({
++      version: 1,
++      plan: { relativePath: identity.relativePath, sha256: identity.sha256 },
++      workflow: 'sdd',
++      execution: { provider: 'session', completion: 'landed' },
++      revision: 1,
++      current: { task: 1, phase: 'implement', round: null, nextAction: 'go' },
++      tasks: parsed.tasks.map((task) => ({
++        number: task.number,
++        title: task.title,
++        state: 'pending',
++        phase: 'implement',
++        round: null,
++        nextAction: null,
++        brief: null,
++        report: null,
++        reviewPackage: null,
++        claim: null,
++        commits: { base: null, head: null },
++      })),
++      decisions: [],
++      rejectedApproaches: [],
++      evidence: [],
++      claims: [],
++      todos: [],
++    }, identity, parsed),
++    /findings must be an array/,
++  );
++});
++
++test('completed task with open findings is a contradiction', async () => {
++  const { root, planPath } = await fixture();
++  await assert.rejects(
++    recordRecovery({
++      root,
++      planPath,
++      config: sessionConfig(),
++      event: {
++        workflow: 'sdd',
++        type: 'complete-task',
++        task: 1,
++        current: { task: 1, phase: 'complete', round: null, nextAction: 'done' },
++        tasks: [{ number: 1, state: 'complete', phase: 'complete', round: null }],
++        findings: [{ id: 'f1', task: 1, status: 'open', summary: 'still open', evidence: [] }],
++        todos: [{ id: 't1', content: 'Task 1', status: 'completed' }],
++      },
++    }),
++    /open findings/,
++  );
++});
++
++test('legacy later fix rounds replace earlier open findings and keep exact rulings', () => {
++  const parsed = parseLegacyLedger(`# SDD ledger — plan: docs/project/plans/feature.md
++Task 2: fix round 1/5 (0 addressed, 1 open — old finding; changes a..b)
++Task 2: Ruling: use the existing helper — because the spec says so — rework if the helper is wrong
++Task 2: fix round 2/5 (1 addressed, 1 open — remaining gap; changes b..c)
++`, 'docs/project/plans/feature.md');
++  const open = parsed.findings.filter((finding) => finding.status === 'open');
++  assert.deepEqual(open.map((finding) => finding.summary), ['remaining gap']);
++  assert.equal(
++    parsed.decisions[0].sourceText,
++    'Task 2: Ruling: use the existing helper — because the spec says so — rework if the helper is wrong',
++  );
++});
++
++test('legacy conversion requires explicit enrollment and copies the original', async () => {
++  const { root, planPath, identity } = await fixture();
++  const legacyDir = join(root, '.sjujperpowers/sdd/feature');
++  await mkdir(legacyDir, { recursive: true });
++  const legacy = `# SDD ledger — plan: docs/project/plans/feature.md
++Task 1: complete (changes aaa..bbb, review clean)
++Task 2: implementer DONE (changes bbb..ccc)
++Task 2: fix round 1/5 (0 addressed, 1 open — missing progress reporting; changes ccc..ddd)
++`;
++  const legacyPath = join(legacyDir, 'progress.md');
++  await writeFile(legacyPath, legacy);
++  await writeFile(join(legacyDir, 'task-2-report.md'), 'report\n');
++  await assert.rejects(
++    migrateRecovery({ root, planPath, config: sessionConfig(), enroll: false }),
++    /explicit enroll/,
++  );
++  const migrated = await migrateRecovery({ root, planPath, config: sessionConfig(), enroll: true });
++  assert.equal(migrated.enrolled, true);
++  assert.equal(migrated.preservedOriginal.sha256, sha256(legacy));
++  assert.match(migrated.preservedOriginal.path, /retained/);
++  assert.equal(await readFile(legacyPath, 'utf8'), legacy);
++  assert.equal(migrated.snapshot.tasks[1].round, 1);
++});
++
++test('ambiguous legacy lines stop without guessing completion', async () => {
++  const { root, planPath } = await fixture();
++  const legacyDir = join(root, '.sjujperpowers/sdd/feature');
++  await mkdir(legacyDir, { recursive: true });
++  await writeFile(
++    join(legacyDir, 'progress.md'),
++    `# SDD ledger — plan: docs/project/plans/feature.md
++Task 1 is probably done
++`,
++  );
++  await assert.rejects(
++    migrateRecovery({ root, planPath, config: sessionConfig(), enroll: true }),
++    /ambiguous/,
++  );
++});
++
++test('unenrolled export does not invent completion or write a snapshot', async () => {
++  const { root, planPath, identity } = await fixture();
++  const projection = await exportRecovery({ root, planPath, config: sessionConfig() });
++  assert.equal(projection.recovery.status, 'ineligible');
++  assert.equal(projection.tasks[0].state, 'pending');
++  await assert.rejects(readFile(identity.progressPath));
++});

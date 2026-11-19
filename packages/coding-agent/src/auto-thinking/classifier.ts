@@ -14,6 +14,7 @@
  * Throws on any failure (no model, no key, unparseable output, abort/timeout);
  * the caller falls back to a concrete level and continues the turn.
  */
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import {
 	type AssistantMessage,
 	completeSimple,
@@ -30,6 +31,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import difficultySystemPrompt from "../prompts/system/auto-thinking-difficulty.md" with { type: "text" };
 import difficultyLocalPrompt from "../prompts/system/auto-thinking-difficulty-local.md" with { type: "text" };
+import { completeImplFromStreamFn, rejectEnrolledUnsupportedInference } from "../session/continuation-complete";
 import { clampAutoThinkingEffort } from "../thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
 import {
@@ -94,6 +96,7 @@ export interface ClassifyDifficultyDeps {
 	signal?: AbortSignal;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	onUsage?: (usage: ClassifierUsage) => void;
+	streamFn?: StreamFn;
 }
 
 export interface ClassifierUsage {
@@ -143,9 +146,10 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 	const metadata = deps.metadataResolver?.(model.provider);
 	const maxTokens = ONLINE_REASONING_SAFE_MAX_TOKENS;
 
+	const complete = deps.streamFn ? completeImplFromStreamFn(deps.streamFn) : completeSimple;
 	const response = await retryTransientCompletion(
 		() =>
-			completeSimple(
+			complete(
 				model,
 				{
 					systemPrompt: [difficultySystemPromptFor(ceiling)],
@@ -186,6 +190,10 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 }
 
 async function classifyLocal(input: string, modelKey: string, deps: ClassifyDifficultyDeps): Promise<Effort> {
+	rejectEnrolledUnsupportedInference(
+		deps.streamFn !== undefined,
+		"Continuation HTTP admission is unsupported for local tiny auto-thinking inference",
+	);
 	if (!isTinyMemoryLocalModelKey(modelKey)) {
 		throw new Error(`auto-thinking: unsupported local classifier model: ${modelKey}`);
 	}

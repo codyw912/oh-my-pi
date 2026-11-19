@@ -47,6 +47,7 @@ import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-life
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
+import type { ContinuationBindingFactory } from "../session/continuation-binding";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
 import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
@@ -557,6 +558,8 @@ export interface ExecutorOptions {
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
+	/** Generation-bound factory from an enrolled parent; omitted for ordinary sessions. */
+	continuationFactory?: ContinuationBindingFactory;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -3409,6 +3412,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				onFirstChatDispatch: () => {
 					firstChatDispatchAt ??= performance.now();
 				},
+				continuationFactory: options.continuationFactory,
 			});
 
 			const sessionManager = await awaitAbortable(sessionManagerPromise);

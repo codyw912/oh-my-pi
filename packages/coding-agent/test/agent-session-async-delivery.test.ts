@@ -123,6 +123,7 @@ describe("AgentSession owner-routed async delivery", () => {
 	it("carries a schema-valid background task's structured output as a pointer only", () => {
 		const job: AsyncJob = {
 			id: "SchemaProbe",
+			executionId: "SchemaProbe",
 			type: "task",
 			status: "completed",
 			startTime: Date.now(),
@@ -159,6 +160,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		// handle with no backing `<id>.md`/`.json` on disk (PR #10625 review).
 		const job: AsyncJob = {
 			id: "Foo-t1-2",
+			executionId: "Foo-t1-2",
 			agentId: "Foo-t1",
 			type: "task",
 			status: "completed",
@@ -189,6 +191,7 @@ describe("AgentSession owner-routed async delivery", () => {
 		// only model-visible copy for oversized payloads).
 		const job: AsyncJob = {
 			id: "SchemaProbe",
+			executionId: "SchemaProbe",
 			type: "task",
 			status: "completed",
 			startTime: Date.now(),
@@ -227,6 +230,7 @@ describe("AgentSession owner-routed async delivery", () => {
 	it("omits the agent:// pointer for an invalid result with no data to recover", () => {
 		const job: AsyncJob = {
 			id: "SchemaProbe",
+			executionId: "SchemaProbe",
 			type: "task",
 			status: "completed",
 			startTime: Date.now(),

@@ -1,9 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { completeSimple, Effort, retryTransientCompletion } from "@oh-my-pi/pi-ai";
+import { Effort, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { prompt, withFileLock } from "@oh-my-pi/pi-utils";
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -85,6 +87,8 @@ export async function runSharpshooterConsolidation(options: {
 	modelRegistry: ModelRegistry;
 	sessionId: string;
 	force?: boolean;
+	inferenceStreamFn?: StreamFn;
+	enrolled?: boolean;
 }): Promise<SharpshooterConsolidationResult> {
 	const bankDir = sharpshooterBankDir(options.agentDir, options.cwd);
 	try {
@@ -117,6 +121,8 @@ async function consolidateLocked(
 		modelRegistry: ModelRegistry;
 		sessionId: string;
 		force?: boolean;
+		inferenceStreamFn?: StreamFn;
+		enrolled?: boolean;
 	},
 	bankDir: string,
 ): Promise<SharpshooterConsolidationResult> {
@@ -153,8 +159,9 @@ async function consolidateLocked(
 			maxFileLines: SHARPSHOOTER_MAX_FILE_LINES,
 		});
 
+		const complete = completeImplFromEnrollment(options.inferenceStreamFn, options.enrolled === true);
 		const response = await retryTransientCompletion(() =>
-			completeSimple(
+			complete(
 				model,
 				{
 					systemPrompt: [system],

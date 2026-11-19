@@ -38,6 +38,7 @@ import { resolvePath, withHostGuard } from "../utils";
 import type {
 	AssistantThinkingRenderer,
 	ComposerShapeDefinition,
+	ContinuationWorkflow,
 	Extension,
 	ExtensionAPI,
 	ExtensionContext,
@@ -203,6 +204,25 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		},
 	): void {
 		this.extension.commands.set(name, { name, ...options });
+	}
+
+	registerContinuationWorkflow(workflow: ContinuationWorkflow): void {
+		if (
+			typeof workflow.id !== "string" ||
+			workflow.id.length === 0 ||
+			workflow.id.trim() !== workflow.id ||
+			typeof workflow.exportProjection !== "function"
+		) {
+			throw new Error("Continuation workflows require an explicit id and a read-only exporter");
+		}
+		const workflows = (this.extension.continuationWorkflows ??= new Map());
+		if (workflows.has(workflow.id)) {
+			throw new Error(`Continuation workflow ${workflow.id} is already registered by ${this.extension.path}`);
+		}
+		workflows.set(workflow.id, {
+			definition: Object.freeze({ id: workflow.id, exportProjection: workflow.exportProjection }),
+			extensionPath: this.extension.path,
+		});
 	}
 
 	setLabel(label: string): void {

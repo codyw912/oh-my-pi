@@ -544,7 +544,7 @@ describe("AsyncJobManager", () => {
 		while (!manager.hasPendingDeliveries()) await scheduler.yield();
 
 		expect(manager.hasPendingDeliveries()).toBe(true);
-		const removed = manager.acknowledgeDeliveries([failedJobId]);
+		const removed = await manager.acknowledgeDeliveries([failedJobId]);
 		expect(removed).toBeGreaterThanOrEqual(1);
 
 		const drained = await manager.drainDeliveries({ timeoutMs: 200 });
@@ -649,7 +649,7 @@ describe("AsyncJobManager", () => {
 		expect(subagentCompletions).toEqual([{ jobId: targetJobId, text: "subagent result" }]);
 		expect(manager.hasPendingDeliveries({ ownerId: "3-AuthLoader" })).toBe(false);
 
-		expect(manager.acknowledgeDeliveries([mainJobId])).toBe(0);
+		expect(await manager.acknowledgeDeliveries([mainJobId])).toBe(0);
 		expect(manager.hasPendingDeliveries({ ownerId: "0-Main" })).toBe(false);
 		releaseMainDelivery();
 		await mainDeliveryFinished.promise;
@@ -822,6 +822,456 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
+	});
+
+	test("automatic delivery waits for the enrolled durable receipt", async () => {
+		const manager = new AsyncJobManager({});
+		const release = Promise.withResolvers<void>();
+		const order: string[] = [];
+		manager.registerDeliveryAcceptance("Main", async () => {
+			order.push("persist-start");
+			await release.promise;
+			order.push("persisted");
+		});
+		manager.registerDeliverySink("Main", () => {
+			order.push("delivered");
+		});
+		manager.register("bash", "durable result", async () => "useful output", { ownerId: "Main" });
+		try {
+			await manager.waitForAll();
+			expect(order).toEqual(["persist-start"]);
+			release.resolve();
+			expect(await manager.drainDeliveries({ timeoutMs: 200 })).toBe(true);
+			expect(order).toEqual(["persist-start", "persisted", "delivered"]);
+		} finally {
+			release.resolve();
+			await manager.dispose();
+		}
+	});
+
+	test("persistence failure leaves settled results retrievable and unconsumed", async () => {
+		const manager = new AsyncJobManager({});
+		manager.registerDeliveryAcceptance("Main", async () => {
+			throw new Error("disk full");
+		});
+		const jobId = manager.register("bash", "foreground", async () => "hub output", { ownerId: "Main", id: "fg-1" });
+		await manager.waitForAll();
+
+		await expect(manager.consumeJobResults([jobId])).rejects.toThrow("disk full");
+		await expect(manager.acknowledgeDeliveries([jobId])).rejects.toThrow("disk full");
+
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		expect(manager.isDeliverySuppressed(jobId)).toBe(false);
+		expect(manager.getJob(jobId)?.resultText).toBe("hub output");
+		expect(manager.getJob(jobId)?.status).toBe("completed");
+		expect(manager.evictCompletedJobs({ ownerId: "Main" })).toBe(0);
+		expect(manager.getJob(jobId)?.resultText).toBe("hub output");
+	});
+
+	test("successful receipt precedes acceptance flags", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const order: string[] = [];
+		let jobId = "";
+		manager.registerDeliveryAcceptance("Main", async receipts => {
+			order.push("receipt");
+			expect(receipts).toHaveLength(1);
+			expect(receipts[0]?.jobId).toBe(jobId);
+			const executionId = manager.getJob(jobId)?.executionId;
+			if (executionId === undefined) throw new Error("expected job executionId");
+			expect(receipts[0]?.executionId).toBe(executionId);
+			expect(receipts[0]?.resultText).toBe("done");
+			expect(manager.isJobResultConsumed(jobId)).toBe(false);
+			expect(manager.isDeliverySuppressed(jobId)).toBe(false);
+		});
+		jobId = manager.register("task", "ordered", async () => "done", { ownerId: "Main" });
+		await manager.waitForAll();
+
+		expect(await manager.consumeJobResults([jobId])).toBe(1);
+		order.push("accepted");
+
+		expect(order).toEqual(["receipt", "accepted"]);
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
+		expect(manager.isDeliverySuppressed(jobId)).toBe(true);
+	});
+
+	test("concurrent acceptance does not duplicate the receipt", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		let handlerCalls = 0;
+		manager.registerDeliveryAcceptance("Main", async receipts => {
+			handlerCalls += 1;
+			expect(receipts).toHaveLength(1);
+			started.resolve();
+			await gate.promise;
+		});
+		const jobId = manager.register("task", "once", async () => "payload", { ownerId: "Main" });
+		await manager.waitForAll();
+
+		const first = manager.consumeJobResults([jobId]);
+		await started.promise;
+		const second = manager.consumeJobResults([jobId]);
+		gate.resolve();
+		expect((await Promise.all([first, second])).reduce((sum, count) => sum + count, 0)).toBe(1);
+		expect(handlerCalls).toBe(1);
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
+	});
+
+	test("distinct managers under a frozen clock do not share execution identity", async () => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+		const first = new AsyncJobManager({ onJobComplete: async () => {} });
+		const second = new AsyncJobManager({ onJobComplete: async () => {} });
+		const firstId = first.register("bash", "named", async () => "a", { id: "same", ownerId: "Main" });
+		const secondId = second.register("bash", "named", async () => "b", { id: "same", ownerId: "Main" });
+		await Promise.all([first.waitForAll(), second.waitForAll()]);
+		const firstJob = first.getJob(firstId);
+		const secondJob = second.getJob(secondId);
+		expect(firstId).toBe(secondId);
+		expect(firstJob?.startTime).toBe(1_000);
+		expect(secondJob?.startTime).toBe(1_000);
+		expect(firstJob?.executionId).toBeTruthy();
+		expect(secondJob?.executionId).toBeTruthy();
+		expect(firstJob?.executionId).not.toBe(secondJob?.executionId);
+		now.mockRestore();
+	});
+
+	test("unregistering an acceptance handler cannot no-op accept or evict an enrolled result", async () => {
+		const manager = new AsyncJobManager({});
+		const unregister = manager.registerDeliveryAcceptance("Main", async () => {
+			throw new Error("disk full");
+		});
+		const jobId = manager.register("bash", "kept", async () => "payload", { ownerId: "Main", id: "kept" });
+		await manager.waitForAll();
+		unregister();
+
+		await expect(manager.consumeJobResults([jobId])).rejects.toThrow(/missing for enrolled owner Main/);
+		expect(manager.evictCompletedJobs({ ownerId: "Main" })).toBe(0);
+		expect(manager.getJob(jobId)?.resultText).toBe("payload");
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+	});
+
+	test("duplicate active acceptance or admission ownership is rejected", () => {
+		const manager = new AsyncJobManager({});
+		const unaccept = manager.registerDeliveryAcceptance("Main", async () => {});
+		expect(() => manager.registerDeliveryAcceptance("Main", async () => {})).toThrow(
+			/Delivery acceptance already registered/,
+		);
+		const unadmit = manager.registerJobAdmission("Main", async () => {});
+		expect(() => manager.registerJobAdmission("Main", async () => {})).toThrow(/Job admission already registered/);
+		unaccept();
+		unadmit();
+		manager.registerDeliveryAcceptance("Main", async () => {});
+		manager.registerJobAdmission("Main", async () => {});
+	});
+
+	test("cancel does not persist or reuse a live execution before the run settles", async () => {
+		const manager = new AsyncJobManager({});
+		const release = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"live-cancel",
+			async () => {
+				started.resolve();
+				await release.promise;
+				return "late";
+			},
+			{ id: "same", ownerId: "Main" },
+		);
+		await started.promise;
+		expect(manager.cancel(jobId)).toBe(true);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(await manager.consumeJobResults([jobId])).toBe(0);
+		const colliding = manager.register("bash", "other", async () => "other", { id: "same" });
+		expect(colliding).not.toBe("same");
+		expect(manager.getJob("same")?.executionId).not.toBe(manager.getJob(colliding)?.executionId);
+		release.resolve();
+		await manager.getJob(jobId)?.promise;
+		expect(manager.getJob(jobId)?.resultText).toBe("late");
+	});
+
+	test("cancelled enrolled callback is accepted once after it resolves", async () => {
+		const deliveries: string[] = [];
+		const receipts: Array<{ status?: string; resultText?: string; errorText?: string; jobId?: string }> = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async (jobId, text) => {
+				deliveries.push(`unowned:${jobId}:${text}`);
+			},
+		});
+		manager.registerDeliveryAcceptance("Main", async accepted => {
+			for (const receipt of accepted) {
+				receipts.push({
+					status: receipt.status,
+					resultText: receipt.resultText,
+					errorText: receipt.errorText,
+					jobId: receipt.jobId,
+				});
+			}
+		});
+		manager.registerDeliverySink("Main", (jobId, text) => {
+			deliveries.push(`owned:${jobId}:${text}`);
+		});
+		const release = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"late-success",
+			async () => {
+				started.resolve();
+				await release.promise;
+				return "late result";
+			},
+			{ id: "late-success", ownerId: "Main" },
+		);
+		await started.promise;
+		expect(manager.suppressDeliveries([jobId])).toBe(1);
+		expect(manager.cancel(jobId)).toBe(true);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(await manager.consumeJobResults([jobId])).toBe(0);
+		expect(receipts).toEqual([]);
+		release.resolve();
+		await manager.waitForAll();
+		expect(receipts).toEqual([{ status: "cancelled", resultText: "late result", errorText: undefined, jobId }]);
+		expect(deliveries).toEqual([]);
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(manager.getJob(jobId)?.resultText).toBe("late result");
+		expect(await manager.consumeJobResults([jobId])).toBe(1);
+		expect(receipts).toHaveLength(1);
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
+	});
+
+	test("cancelled enrolled callback is accepted once after it rejects", async () => {
+		const deliveries: string[] = [];
+		const receipts: Array<{ status?: string; resultText?: string; errorText?: string }> = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async (jobId, text) => {
+				deliveries.push(`unowned:${jobId}:${text}`);
+			},
+		});
+		manager.registerDeliveryAcceptance("Main", async accepted => {
+			for (const receipt of accepted) {
+				receipts.push({
+					status: receipt.status,
+					resultText: receipt.resultText,
+					errorText: receipt.errorText,
+				});
+			}
+		});
+		manager.registerDeliverySink("Main", (jobId, text) => {
+			deliveries.push(`owned:${jobId}:${text}`);
+		});
+		const release = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"late-error",
+			async () => {
+				started.resolve();
+				await release.promise;
+				throw new Error("late failure");
+			},
+			{ id: "late-error", ownerId: "Main" },
+		);
+		await started.promise;
+		expect(manager.cancel(jobId)).toBe(true);
+		expect(await manager.consumeJobResults([jobId])).toBe(0);
+		release.resolve();
+		await manager.waitForAll();
+		expect(receipts).toEqual([{ status: "cancelled", resultText: undefined, errorText: "late failure" }]);
+		expect(deliveries).toEqual([]);
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(manager.getJob(jobId)?.errorText).toBe("late failure");
+		expect(await manager.consumeJobResults([jobId])).toBe(1);
+		expect(receipts).toHaveLength(1);
+	});
+
+	test("failed cancelled-settlement persistence stays recoverable", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0 });
+		let attempts = 0;
+		manager.registerDeliveryAcceptance("Main", async () => {
+			attempts += 1;
+			throw new Error("disk full");
+		});
+		const release = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"late-kept",
+			async () => {
+				started.resolve();
+				await release.promise;
+				return "late result";
+			},
+			{ id: "late-kept", ownerId: "Main" },
+		);
+		await started.promise;
+		expect(manager.cancel(jobId)).toBe(true);
+		release.resolve();
+		await manager.waitForAll();
+		expect(attempts).toBe(1);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(manager.getJob(jobId)?.resultText).toBe("late result");
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		await expect(manager.consumeJobResults([jobId])).rejects.toThrow("disk full");
+		expect(attempts).toBe(2);
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		expect(manager.evictCompletedJobs({ ownerId: "Main" })).toBe(0);
+		expect(manager.getJob(jobId)?.resultText).toBe("late result");
+	});
+
+	test("waitForOwnerJobs awaits a replacement execution under a reused name", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const firstGate = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const secondGate = Promise.withResolvers<void>();
+		manager.register(
+			"bash",
+			"first",
+			async () => {
+				await firstGate.promise;
+				return "first";
+			},
+			{ id: "same", ownerId: "Main" },
+		);
+		firstGate.resolve();
+		await manager.waitForAll();
+		await waitForJobEviction(manager, "same");
+		manager.register(
+			"bash",
+			"second",
+			async () => {
+				secondStarted.resolve();
+				await secondGate.promise;
+				return "second";
+			},
+			{ id: "same", ownerId: "Main" },
+		);
+		await secondStarted.promise;
+		await expect(manager.waitForOwnerJobs("Main", { timeoutMs: 20 })).resolves.toBe(false);
+		secondGate.resolve();
+		await expect(manager.waitForOwnerJobs("Main")).resolves.toBe(true);
+	});
+
+	test("denied job admission never launches and failed persistence stays available", async () => {
+		const manager = new AsyncJobManager({});
+		let launched = 0;
+		manager.registerJobAdmission("Main", async () => {
+			throw new Error("launch persist failed");
+		});
+		const jobId = manager.register(
+			"bash",
+			"denied",
+			async () => {
+				launched += 1;
+				return "should not run";
+			},
+			{ ownerId: "Main" },
+		);
+		await manager.waitForAll();
+		expect(launched).toBe(0);
+		expect(manager.getJob(jobId)?.status).toBe("failed");
+		expect(manager.getJob(jobId)?.errorText).toContain("launch persist failed");
+		expect(await manager.consumeJobResults([jobId])).toBe(1);
+	});
+
+	test("successful admission precedes launch and abort during admission skips the run", async () => {
+		const manager = new AsyncJobManager({});
+		const order: string[] = [];
+		const holdAdmit = Promise.withResolvers<void>();
+		const admitStarted = Promise.withResolvers<void>();
+		manager.registerJobAdmission("Main", async intent => {
+			order.push("admit");
+			expect(intent.jobId).toBeTruthy();
+			expect(intent.executionId).toBeTruthy();
+			expect(intent.type).toBe("bash");
+			admitStarted.resolve();
+			await holdAdmit.promise;
+		});
+		const jobId = manager.register(
+			"bash",
+			"gated",
+			async () => {
+				order.push("run");
+				return "ran";
+			},
+			{ ownerId: "Main", id: "gated" },
+		);
+		await admitStarted.promise;
+		expect(order).toEqual(["admit"]);
+		manager.cancel(jobId);
+		holdAdmit.resolve();
+		await manager.waitForAll();
+		expect(order).toEqual(["admit"]);
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(manager.getJob(jobId)?.errorText).toBeTruthy();
+
+		const order2: string[] = [];
+		const manager2 = new AsyncJobManager({ onJobComplete: async () => {} });
+		manager2.registerJobAdmission("Main", async () => {
+			order2.push("admit");
+		});
+		manager2.register(
+			"bash",
+			"ok",
+			async () => {
+				order2.push("run");
+				return "ok";
+			},
+			{ ownerId: "Main" },
+		);
+		await manager2.waitForAll();
+		expect(order2).toEqual(["admit", "run"]);
+	});
+
+	test("temporary suppression of a live job is not acceptance or quiescence", async () => {
+		const manager = new AsyncJobManager({});
+		let calls = 0;
+		manager.registerDeliveryAcceptance("Main", () => {
+			calls += 1;
+		});
+		const jobId = manager.register(
+			"bash",
+			"live",
+			async ({ signal }) => {
+				await new Promise<void>(resolve => {
+					if (signal.aborted) return resolve();
+					signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return "later";
+			},
+			{ id: "live-1", ownerId: "Main" },
+		);
+
+		expect(manager.suppressDeliveries([jobId])).toBe(1);
+		expect(calls).toBe(0);
+		expect(manager.isDeliverySuppressed(jobId)).toBe(true);
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		await expect(manager.waitForOwnerJobs("Main", { timeoutMs: 20 })).resolves.toBe(false);
+		await expect(manager.waitForOwnerJobs("Main", { excludeSuppressed: true })).resolves.toBe(true);
+
+		manager.resumeDeliveries([jobId]);
+		expect(manager.isDeliverySuppressed(jobId)).toBe(false);
+		expect(calls).toBe(0);
+		expect(manager.isJobResultConsumed(jobId)).toBe(false);
+		manager.cancel(jobId, { ownerId: "Main" });
+		await manager.waitForAll();
+	});
+
+	test("acceptance registration is inert until a settled result is accepted", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		let calls = 0;
+		manager.registerDeliveryAcceptance("Main", () => {
+			calls += 1;
+		});
+		expect(calls).toBe(0);
+		const jobId = manager.register("task", "idle", async () => "ok", { ownerId: "Main" });
+		await manager.waitForAll();
+		expect(calls).toBe(0);
+		await manager.acknowledgeDeliveries([jobId]);
+		expect(calls).toBe(1);
 	});
 });
 

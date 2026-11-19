@@ -161,6 +161,7 @@ export class TanCommandController {
 							parentAgentId: ownerId,
 							agentRegistry,
 							disableExtensionDiscovery: true,
+							continuationFactory: this.ctx.session.continuationFactory,
 							// `[]` is truthy and would make the child pick bindPreparedExtensions([])
 							// over a populated path fallback, so collapse an empty list to undefined.
 							preloadedPreparedExtensions: parentPreparedExtensions?.length

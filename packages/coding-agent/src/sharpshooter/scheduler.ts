@@ -1,5 +1,6 @@
 import { logger } from "@oh-my-pi/pi-utils";
 
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import { runSharpshooterConsolidation } from "./consolidate";
@@ -22,6 +23,8 @@ export function startSharpshooterScheduler(options: {
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	sessionId: string;
+	inferenceStreamFn?: StreamFn;
+	enrolled?: boolean;
 }): () => void {
 	const bankDir = sharpshooterBankDir(options.agentDir, options.cwd);
 	const existing = schedulers.get(bankDir);

@@ -185,7 +185,7 @@ export class WorkPool {
 							return job ? [job.promise] : [];
 						}),
 					);
-					manager.consumeJobResults(batchIds);
+					await manager.consumeJobResults(batchIds);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;

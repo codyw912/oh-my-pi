@@ -1050,7 +1050,7 @@ export class VibeSessionRegistry {
 		}
 
 		const settled = collectSettled();
-		manager.acknowledgeDeliveries(settled.map(entry => entry.jobId));
+		await manager.acknowledgeDeliveries(settled.map(entry => entry.jobId));
 		// Current in-flight state, independent of the snapshot: a session whose
 		// watched turn settled may already be mid queued follow-up.
 		const stillRunning = watched.filter(record => record.turn !== undefined).map(record => record.id);
@@ -1366,6 +1366,7 @@ export class VibeSessionRegistry {
 			parentEvalSessionId: session.getEvalSessionId?.() ?? undefined,
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
+			continuationFactory: session.continuationFactory,
 			keepAlive: true,
 		};
 	}

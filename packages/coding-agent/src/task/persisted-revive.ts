@@ -182,6 +182,7 @@ export function createPersistedSubagentReviverFactory(
 							mcpManager,
 							customTools: mcpProxyTools.length > 0 ? mcpProxyTools : undefined,
 						}),
+				continuationFactory: ctx.session.continuationFactory,
 			});
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools

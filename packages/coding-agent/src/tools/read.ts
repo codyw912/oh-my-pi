@@ -1042,13 +1042,27 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				);
 			}
 			if (question && resolved) {
+				const completeImpl = this.session.inferenceStreamFn
+					? async (
+							requestModel: Parameters<typeof completeSimple>[0],
+							context: Parameters<typeof completeSimple>[1],
+							options?: Parameters<typeof completeSimple>[2],
+						) => {
+							const stream = await this.session.inferenceStreamFn!(requestModel, context, options);
+							return stream.result();
+						}
+					: this.session.continuationFactory
+						? () => {
+								throw new ToolError("Continuation HTTP admission is required for image questions");
+							}
+						: this.completeImageRequest;
 				const answer = await askImageQuestion(
 					this.session,
 					resolved,
 					imageInput,
 					question,
 					signal,
-					this.completeImageRequest,
+					completeImpl as typeof completeSimple,
 				);
 				return {
 					content: [{ type: "text", text: answer.text }],

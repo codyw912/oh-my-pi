@@ -157,6 +157,9 @@ import {
 	type SecretObfuscator,
 } from "./secrets";
 import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
+import type { ContinuationBindingFactory } from "./session/continuation-binding";
+import type { ContinuationPreparationOptions } from "./session/continuation-handoff";
+import { registerContinuationTransport } from "./session/continuation-request";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { DateCwdReminderInjector } from "./session/date-cwd-reminder";
@@ -656,6 +659,14 @@ export interface CreateAgentSessionOptions {
 
 	/** Whether to auto-approve all tool calls (--auto-approve CLI flag). Default: false */
 	autoApprove?: boolean;
+	/**
+	 * Explicit continuation enrollment for this session only. Ordinary sessions
+	 * omit it. Workers and cold revivers receive the same generation-bound factory
+	 * from the enrolled owner; it is never installed globally.
+	 */
+	continuationFactory?: ContinuationBindingFactory;
+	/** Explicit opt-in; never enables ordinary same-history provider fallback. */
+	continuationPreparation?: Omit<ContinuationPreparationOptions, "destination">;
 }
 
 /** Result from createAgentSession */
@@ -1921,6 +1932,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// this undefined so tools and session job snapshots refuse async work
 			// instead of silently routing into the owning session (issue #1923).
 			asyncJobManager: scopedAsyncJobManager,
+			get continuationFactory() {
+				return session?.continuationFactory ?? options.continuationFactory;
+			},
+			get inferenceStreamFn() {
+				return session?.inferenceStreamFn;
+			},
 		};
 		let browserPrelude: EvalPreludeDefinition | undefined;
 		let computerPrelude: EvalPreludeDefinition | undefined;
@@ -3583,7 +3600,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					supportsExternalThinking(streamModel);
 				return settingsAwareStreamFn(streamModel, context, {
 					...streamOptions,
-					anthropicCacheRefresh: true,
+					anthropicCacheRefresh: streamOptions?.anthropicCacheRefresh ?? true,
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
 					...(codeModeState.namespacesInfo === undefined
 						? {}
@@ -3621,6 +3638,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: undefined
 				: undefined,
 		});
+		if (options.continuationFactory) {
+			registerContinuationTransport(settingsAwareStreamFn);
+			registerContinuationTransport(agent.streamFn);
+		}
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
 
@@ -3840,6 +3861,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// resource frame would otherwise report every server as empty.
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
+			continuationFactory: options.continuationFactory,
+			continuationPreparation: options.continuationPreparation,
 		});
 		hasSession = true;
 		// Backfill the resumed advisor spend without blocking startup: the scan
@@ -4302,6 +4325,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		} catch (error) {
 			logger.warn("Code Mode initialization at session startup failed", { error: String(error) });
 		}
+		await session.whenContinuationReady();
 
 		return {
 			session,

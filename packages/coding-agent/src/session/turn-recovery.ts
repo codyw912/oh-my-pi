@@ -1,9 +1,11 @@
 import { scheduler } from "node:timers/promises";
+import type { AdmissionOutcome } from "./continuation-binding";
 import {
 	type Agent,
 	AgentBusyError,
 	type AgentMessage,
 	isSyntheticToolResultMessage,
+	type StreamFn,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type {
@@ -231,6 +233,8 @@ export interface TurnRecoveryHost {
 		},
 	): Promise<RecoveryCompactionResult>;
 	withBashBranchTransition<T>(operation: () => T): T;
+	beforeRecovery(error?: unknown): Promise<AdmissionOutcome>;
+	inferenceStreamFn?(): StreamFn | undefined;
 }
 
 /** Construction-time retry state restored from model selection. */
@@ -935,6 +939,7 @@ export class TurnRecovery {
 					sessionId: this.#host.sessionId(),
 					metadataResolver: (provider: string) => this.#host.agent.metadataForProvider(provider),
 					signal: controller.signal,
+					streamFn: this.#host.inferenceStreamFn?.(),
 				});
 			} finally {
 				clearTimeout(timeout);
@@ -1604,6 +1609,7 @@ export class TurnRecovery {
 	}
 
 	async #maybeApplyUsageAwareFallback(signal: AbortSignal, confirmer?: UsageFallbackConfirmer): Promise<boolean> {
+		if ((await this.#host.beforeRecovery()).kind !== "allow") return false;
 		if (!this.#host.settings.get("retry.usageAwareFallback")) return false;
 		const currentModel = this.#host.model();
 		if (!currentModel) return false;
@@ -2458,6 +2464,22 @@ export class TurnRecovery {
 		// pattern instead of re-sampling the same stalled reasoning.
 		this.#maybeInjectThinkingLoopRedirect(id);
 
+		if (waitForUsageReset || (usageLimitWaitMs !== undefined && usageLimitWaitMs > 0)) {
+			if ((await this.#host.beforeRecovery(message)).kind !== "allow") {
+				await this.persistTerminalEmptyErrorTurn(message);
+				const attempt = this.#retryAttempt;
+				this.#retryAttempt = 0;
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt,
+					finalError: errorMessage,
+				});
+				this.#clearPendingRetryErrors();
+				this.resolveRetry();
+				return false;
+			}
+		}
 		// Wait with exponential backoff (abortable).
 		const retryAbortController = new AbortController();
 		this.#retryAbortController?.abort();

@@ -81,6 +81,12 @@ export interface AsyncJobDetails extends Record<string, unknown> {
 
 export interface AsyncJob {
 	id: string;
+	/**
+	 * Stable identity for this registration. Distinct from {@link id}, which
+	 * is a reusable job name: a frozen clock or a later job that reuses the
+	 * same name cannot collapse two executions.
+	 */
+	executionId: string;
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
@@ -131,6 +137,51 @@ export interface AsyncJob {
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
 
+/**
+ * Immutable snapshot of one settled execution, handed to a registered
+ * {@link DeliveryAcceptanceHandler} before the manager marks the result
+ * accepted, suppressed, or consumed.
+ */
+export interface DeliveryAcceptanceSnapshot {
+	executionId: string;
+	jobId: string;
+	ownerId?: string;
+	type: AsyncJobType;
+	status: Exclude<AsyncJob["status"], "running">;
+	label: string;
+	resultText?: string;
+	errorText?: string;
+	structured?: StructuredSubagentOutput;
+	startTime: number;
+	agentId?: string;
+	latestDetails?: AsyncJobDetails;
+	/** True only after the registered run callback finished (cancel is not settlement). */
+	executionSettled: true;
+}
+
+/**
+ * Owner-scoped persistence hook. Invoked with frozen snapshots of the exact
+ * executions being accepted. Throw to reject persistence: the manager leaves
+ * results available and does not mark them accepted.
+ */
+export type DeliveryAcceptanceHandler = (receipts: readonly DeliveryAcceptanceSnapshot[]) => void | Promise<void>;
+
+/** Launch-intent snapshot persisted before the registered run callback starts. */
+export interface JobAdmissionSnapshot {
+	executionId: string;
+	jobId: string;
+	ownerId?: string;
+	type: AsyncJobType;
+	label: string;
+	startTime: number;
+}
+
+/**
+ * Owner-scoped launch-intent hook. Invoked immediately before the registered
+ * run callback. Throw to deny launch: the run is not invoked.
+ */
+export type JobAdmissionHandler = (intent: JobAdmissionSnapshot) => void | Promise<void>;
+
 export interface AsyncJobManagerOptions {
 	/**
 	 * Delivery sink for UNOWNED completions (jobs registered without an
@@ -162,6 +213,7 @@ export interface AsyncJobManagerOptions {
 
 interface AsyncJobDelivery {
 	jobId: string;
+	executionId: string;
 	text: string;
 	attempt: number;
 	nextAttemptAt: number;
@@ -176,7 +228,19 @@ interface AsyncJobDelivery {
 	 * retrying) — without it, a recovered delivery would silently drop
 	 * `structured` even though `text` survives on the delivery itself.
 	 */
-	jobSnapshot?: Pick<AsyncJob, "type" | "status" | "startTime" | "label" | "structured" | "agentId" | "latestDetails">;
+	jobSnapshot?: Pick<
+		AsyncJob,
+		| "executionId"
+		| "type"
+		| "status"
+		| "startTime"
+		| "label"
+		| "structured"
+		| "agentId"
+		| "latestDetails"
+		| "resultText"
+		| "errorText"
+	>;
 }
 
 export interface AsyncJobDeliveryState {
@@ -233,12 +297,25 @@ export class AsyncJobManager {
 	readonly #jobs = new Map<string, AsyncJob>();
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
-	readonly #suppressedDeliveries = new Set<string>();
+	/** Temporary foreground-wait suppression, keyed by execution id. */
+	readonly #tempSuppressed = new Set<string>();
+	/** Foreground acknowledge/consume suppression, keyed by execution id. */
+	readonly #deliveryAcknowledged = new Set<string>();
 	readonly #watchedJobs = new Set<string>();
-	readonly #consumedJobResults = new Set<string>();
+	readonly #consumedExecutions = new Set<string>();
+	readonly #acceptedExecutions = new Set<string>();
+	/** Executions whose run callback finished (cancel status is not enough). */
+	readonly #runSettled = new Set<string>();
+	/** Owner bound at registration when an acceptance handler was active. */
+	readonly #enrolledAcceptance = new Map<string, string>();
+	/** Owner bound at registration when an admission handler was active. */
+	readonly #enrolledAdmission = new Map<string, string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
+	readonly #acceptanceHandlers = new Map<string, DeliveryAcceptanceHandler>();
+	readonly #admissionHandlers = new Map<string, JobAdmissionHandler>();
+	readonly #persistInFlight = new Map<string, Promise<void>>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -311,23 +388,26 @@ export class AsyncJobManager {
 		}
 
 		const id = this.#resolveJobId(options?.id);
-		this.#suppressedDeliveries.delete(id);
-		this.#consumedJobResults.delete(id);
+		const executionId = this.#allocateExecutionId();
 		const abortController = new AbortController();
 		const startTime = Date.now();
+		const ownerId = options?.ownerId;
 
 		const job: AsyncJob = {
 			id,
+			executionId,
 			type,
 			status: "running",
 			startTime,
 			label,
 			abortController,
 			promise: Promise.resolve(),
-			ownerId: options?.ownerId,
+			ownerId,
 			agentId: options?.agentId,
 			queued: options?.queued === true,
 		};
+		if (ownerId && this.#acceptanceHandlers.has(ownerId)) this.#enrolledAcceptance.set(executionId, ownerId);
+		if (ownerId && this.#admissionHandlers.has(ownerId)) this.#enrolledAdmission.set(executionId, ownerId);
 
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
 			if (details) job.latestDetails = details;
@@ -342,7 +422,12 @@ export class AsyncJobManager {
 			}
 		};
 		job.promise = (async () => {
+			let deliveryText: string | undefined;
 			try {
+				if (this.#enrolledAdmission.has(executionId)) {
+					const launched = await this.#admitRegisteredRun(job);
+					if (!launched || abortController.signal.aborted) return;
+				}
 				const outcome = await run({
 					jobId: id,
 					signal: abortController.signal,
@@ -356,24 +441,25 @@ export class AsyncJobManager {
 				if (structured) job.structured = structured;
 				if (job.status === "cancelled") {
 					job.resultText = text;
-					this.#scheduleEviction(id);
 					return;
 				}
 				job.status = "completed";
 				job.resultText = text;
-				this.#enqueueDelivery(id, text);
-				this.#scheduleEviction(id);
+				deliveryText = text;
 			} catch (error) {
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
-					this.#scheduleEviction(id);
 					return;
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				job.errorText = errorText;
-				this.#enqueueDelivery(id, errorText);
+				deliveryText = errorText;
+			} finally {
+				this.#runSettled.add(executionId);
+				if (deliveryText !== undefined) this.#enqueueDelivery(id, deliveryText);
+				else await this.#acceptCancelledSettlement(job);
 				this.#scheduleEviction(id);
 			}
 		})();
@@ -394,7 +480,6 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
-		this.#scheduleEviction(id);
 		return true;
 	}
 
@@ -483,60 +568,96 @@ export class AsyncJobManager {
 		this.#pollEscalation.set(ownerId, { level: prev?.level ?? 0, lastPollEndAt: now });
 	}
 
-	acknowledgeDeliveries(jobIds: string[]): number {
-		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
-		if (uniqueJobIds.length === 0) return 0;
-
+	/**
+	 * Temporarily suppress delivery for a live foreground wait. Does not persist,
+	 * consume, or count as quiescence. Pair with {@link resumeDeliveries} if the
+	 * wait backgrounds the job instead of recovering its result.
+	 */
+	suppressDeliveries(jobIds: string[]): number {
+		const uniqueJobIds = this.#uniqueJobIds(jobIds);
+		let suppressed = 0;
 		for (const jobId of uniqueJobIds) {
-			this.#suppressedDeliveries.add(jobId);
+			const job = this.#jobs.get(jobId);
+			if (!job) continue;
+			if (this.#tempSuppressed.has(job.executionId)) continue;
+			this.#tempSuppressed.add(job.executionId);
+			suppressed += 1;
 		}
+		this.#dropSuppressedQueuedDeliveries();
+		return suppressed;
+	}
 
+	/**
+	 * Persist then suppress queued delivery for settled executions. A registered
+	 * owner handler runs before flags change; failure leaves results available.
+	 */
+	async acknowledgeDeliveries(jobIds: string[]): Promise<number> {
+		const snapshots = this.#snapshotSettled(jobIds);
+		if (snapshots.length > 0) await this.#persistSnapshots(snapshots);
 		const before = this.#deliveries.length;
-		this.#deliveries.splice(
-			0,
-			this.#deliveries.length,
-			...this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId)),
-		);
-		this.#notifyDeliveryQueueChanged();
+		const requested = new Set(jobIds);
+		for (const queue of [this.#deliveries, this.#inFlightDeliveries]) {
+			for (const delivery of queue) {
+				// Unaccepted enrolled executions cannot be evicted. An orphan here
+				// is therefore ordinary or already durably accepted.
+				if (requested.has(delivery.jobId) && !this.#jobs.has(delivery.jobId)) {
+					this.#deliveryAcknowledged.add(delivery.executionId);
+				}
+			}
+		}
+		for (const snapshot of snapshots) {
+			if (!this.#stillCurrent(snapshot)) continue;
+			this.#deliveryAcknowledged.add(snapshot.executionId);
+			this.#maybeScheduleEviction(snapshot.jobId);
+		}
+		this.#dropSuppressedQueuedDeliveries();
 		return before - this.#deliveries.length;
 	}
 
 	/**
-	 * Mark settled job results as recovered by a foreground snapshot.
+	 * Persist then mark settled results recovered by a foreground snapshot.
 	 *
 	 * Suppresses queued delivery and marks retained bodies as consumed so later
 	 * snapshots report execution state without replaying the same result.
 	 */
-	consumeJobResults(jobIds: string[]): number {
-		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
-		this.acknowledgeDeliveries(uniqueJobIds);
+	async consumeJobResults(jobIds: string[]): Promise<number> {
+		const snapshots = this.#snapshotSettled(jobIds);
+		if (snapshots.length === 0) return 0;
+		await this.#persistSnapshots(snapshots);
 		let consumed = 0;
-		for (const jobId of uniqueJobIds) {
-			if (this.#consumeJobResult(jobId)) consumed += 1;
+		for (const snapshot of snapshots) {
+			if (!this.#stillCurrent(snapshot)) continue;
+			this.#deliveryAcknowledged.add(snapshot.executionId);
+			this.#maybeScheduleEviction(snapshot.jobId);
+			if (this.#consumeExecution(snapshot.jobId, snapshot.executionId)) consumed += 1;
 		}
+		this.#dropSuppressedQueuedDeliveries();
 		return consumed;
 	}
 
 	/** True once a result was auto-delivered or recovered by a foreground snapshot. */
 	isJobResultConsumed(jobId: string): boolean {
-		return this.#consumedJobResults.has(jobId);
+		const job = this.#jobs.get(jobId);
+		if (!job) return false;
+		return this.#consumedExecutions.has(job.executionId);
 	}
 
 	/**
-	 * Lift a foreground-wait suppression set via `acknowledgeDeliveries`. If the
-	 * job already finished while suppressed (its delivery enqueue was skipped),
-	 * re-enqueue the completion so the result is still delivered exactly once.
+	 * Lift a foreground-wait suppression set via {@link suppressDeliveries}. If
+	 * the job already finished while suppressed (its delivery enqueue was
+	 * skipped), re-enqueue the completion so the result is still delivered
+	 * exactly once. Does not undo an accepted/consumed receipt.
 	 */
 	resumeDeliveries(jobIds: string[]): void {
-		for (const rawId of jobIds) {
-			const jobId = rawId.trim();
-			if (!jobId) continue;
-			if (!this.#suppressedDeliveries.delete(jobId)) continue;
+		for (const jobId of this.#uniqueJobIds(jobIds)) {
 			const job = this.#jobs.get(jobId);
-			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
+			if (!job || !this.#tempSuppressed.delete(job.executionId)) continue;
+			if (this.#deliveryAcknowledged.has(job.executionId)) continue;
+			if (!this.#runSettled.has(job.executionId)) continue;
+			if (job.status !== "completed" && job.status !== "failed") continue;
 			const queued =
-				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
-				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
+				this.#deliveries.some(delivery => delivery.executionId === job.executionId) ||
+				this.#inFlightDeliveries.some(delivery => delivery.executionId === job.executionId);
 			if (queued) continue;
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 		}
@@ -560,7 +681,6 @@ export class AsyncJobManager {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
 			job.abortController.abort(reason);
-			this.#scheduleEviction(job.id);
 		}
 	}
 
@@ -570,15 +690,17 @@ export class AsyncJobManager {
 	 * session's result can never be injected into a later transcript. Returns the
 	 * number of jobs evicted.
 	 *
-	 * A delivery whose sink call is already in flight (or drained onto a caller's
-	 * yield queue) is guarded by the owner's delivery generation, not the per-id
-	 * suppression marker — that marker is cleared when the id is reused.
+	 * Enrolled unaccepted executions stay until a bound owner handler persists
+	 * them. Live cancelled work is not evicted until the run actually finishes.
 	 */
 	evictCompletedJobs(filter?: AsyncJobFilter): number {
 		let evicted = 0;
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
 			if (job.status !== "completed" && job.status !== "failed") continue;
-			this.acknowledgeDeliveries([job.id]);
+			if (!this.#runSettled.has(job.executionId)) continue;
+			if (this.#mustRetainUnaccepted(job)) continue;
+			this.#deliveryAcknowledged.add(job.executionId);
+			this.#dropSuppressedQueuedDeliveries();
 			if (this.#evictJob(job.id)) evicted += 1;
 		}
 		return evicted;
@@ -606,15 +728,43 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Wait until every job owned by `ownerId` has settled — its run promise
-	 * resolved, which for cancelled jobs means the underlying process actually
-	 * exited. Jobs registered while waiting (e.g. by a follow-up turn) are
-	 * awaited too. Returns false when `timeoutMs` elapses first.
+	 * Register the persistence hook invoked before a settled execution is
+	 * accepted, suppressed, or consumed. Inert until an actual acceptance.
+	 * Duplicate active ownership for the same owner id is rejected.
+	 */
+	registerDeliveryAcceptance(ownerId: string, handler: DeliveryAcceptanceHandler): () => void {
+		if (this.#acceptanceHandlers.has(ownerId)) {
+			throw new Error(`Delivery acceptance already registered for owner ${ownerId}`);
+		}
+		this.#acceptanceHandlers.set(ownerId, handler);
+		return () => {
+			if (this.#acceptanceHandlers.get(ownerId) === handler) this.#acceptanceHandlers.delete(ownerId);
+		};
+	}
+
+	/**
+	 * Register the launch-intent hook invoked immediately before the registered
+	 * run callback. Inert until a matching enrolled execution is admitted.
+	 * Duplicate active ownership for the same owner id is rejected.
+	 */
+	registerJobAdmission(ownerId: string, handler: JobAdmissionHandler): () => void {
+		if (this.#admissionHandlers.has(ownerId)) {
+			throw new Error(`Job admission already registered for owner ${ownerId}`);
+		}
+		this.#admissionHandlers.set(ownerId, handler);
+		return () => {
+			if (this.#admissionHandlers.get(ownerId) === handler) this.#admissionHandlers.delete(ownerId);
+		};
+	}
+
+	/**
+	 * Wait until every job owned by `ownerId` has actually settled — its run
+	 * promise resolved, which for cancelled jobs means the underlying process
+	 * actually exited. Replacements under a reused name are tracked by
+	 * execution id. Returns false when `timeoutMs` elapses first.
 	 *
-	 * `excludeSuppressed` skips jobs whose delivery is suppressed (acknowledged
-	 * or `hub`-watched): those can never re-wake a run, so quiescence barriers
-	 * pass it to share one contract with the pending-async-wake predicate.
-	 * Teardown reaps omit it — worktree safety concerns every owner process.
+	 * `excludeSuppressed` is wake-oriented: skipped jobs cannot re-wake a run.
+	 * Continuation quiescence must omit it so live suppressed work is awaited.
 	 */
 	async waitForOwnerJobs(
 		ownerId: string,
@@ -624,11 +774,13 @@ export class AsyncJobManager {
 			options?.timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + Math.max(0, options.timeoutMs);
 		const awaited = new Set<string>();
 		for (;;) {
-			const pending = this.#filterJobs(this.#jobs.values(), { ownerId }).filter(
-				job => !awaited.has(job.id) && (options?.excludeSuppressed !== true || !this.isDeliverySuppressed(job.id)),
-			);
+			const pending = this.#filterJobs(this.#jobs.values(), { ownerId }).filter(job => {
+				if (awaited.has(job.executionId) || this.#runSettled.has(job.executionId)) return false;
+				if (options?.excludeSuppressed === true && this.isDeliverySuppressed(job.id)) return false;
+				return true;
+			});
 			if (pending.length === 0) return true;
-			for (const job of pending) awaited.add(job.id);
+			for (const job of pending) awaited.add(job.executionId);
 			const settled = await this.#waitForDeliveryPromise(
 				Promise.all(pending.map(job => job.promise)).then(() => {}),
 				deadline,
@@ -741,19 +893,28 @@ export class AsyncJobManager {
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
 		this.#inFlightDeliveries.length = 0;
-		this.#suppressedDeliveries.clear();
+		this.#tempSuppressed.clear();
+		this.#deliveryAcknowledged.clear();
 		this.#watchedJobs.clear();
-		this.#consumedJobResults.clear();
+		this.#consumedExecutions.clear();
+		this.#acceptedExecutions.clear();
+		this.#runSettled.clear();
+		this.#enrolledAcceptance.clear();
+		this.#enrolledAdmission.clear();
 		this.#pollEscalation.clear();
 		this.#deliverySinks.clear();
+		this.#acceptanceHandlers.clear();
+		this.#admissionHandlers.clear();
+		this.#persistInFlight.clear();
 		return jobsSettled && drained;
 	}
 
-	#consumeJobResult(jobId: string): boolean {
+	#consumeExecution(jobId: string, executionId: string): boolean {
 		const job = this.#jobs.get(jobId);
-		if (!job || job.status === "running" || this.#consumedJobResults.has(jobId)) return false;
+		if (!job || job.executionId !== executionId || job.status === "running") return false;
+		if (this.#consumedExecutions.has(executionId)) return false;
 		if (job.resultText === undefined && job.errorText === undefined) return false;
-		this.#consumedJobResults.add(jobId);
+		this.#consumedExecutions.add(executionId);
 		return true;
 	}
 
@@ -876,18 +1037,31 @@ export class AsyncJobManager {
 	}
 
 	#evictJob(jobId: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (job && !this.#disposed) {
+			if (!this.#runSettled.has(job.executionId)) return false;
+			if (this.#mustRetainUnaccepted(job)) return false;
+		}
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
-		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
-		this.#consumedJobResults.delete(jobId);
-		const job = this.#jobs.get(jobId);
-		if (job) this.#runRetainedArtifactsCleanup(job);
+		if (job) {
+			this.#tempSuppressed.delete(job.executionId);
+			this.#deliveryAcknowledged.delete(job.executionId);
+			this.#consumedExecutions.delete(job.executionId);
+			this.#acceptedExecutions.delete(job.executionId);
+			this.#enrolledAcceptance.delete(job.executionId);
+			this.#enrolledAdmission.delete(job.executionId);
+			this.#runRetainedArtifactsCleanup(job);
+		}
 		return this.#jobs.delete(jobId);
 	}
 
 	#scheduleEviction(jobId: string): void {
 		if (this.#disposed) return;
+		const job = this.#jobs.get(jobId);
+		if (job && !this.#runSettled.has(job.executionId)) return;
+		if (job && this.#mustRetainUnaccepted(job)) return;
 		if (this.#retentionMs <= 0) {
 			this.#evictJob(jobId);
 			return;
@@ -897,6 +1071,12 @@ export class AsyncJobManager {
 			clearTimeout(existing);
 		}
 		const timer = setTimeout(() => {
+			const current = this.#jobs.get(jobId);
+			if (current && !this.#runSettled.has(current.executionId)) return;
+			if (current && this.#mustRetainUnaccepted(current)) {
+				this.#evictionTimers.delete(jobId);
+				return;
+			}
 			this.#evictJob(jobId);
 		}, this.#retentionMs);
 		timer.unref();
@@ -912,17 +1092,17 @@ export class AsyncJobManager {
 
 	#filterDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
 		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#deliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
+		if (!ownerId) return this.#deliveries.filter(delivery => !this.#isDeliveryRecordSuppressed(delivery));
 		return this.#deliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => delivery.ownerId === ownerId && !this.#isDeliveryRecordSuppressed(delivery),
 		);
 	}
 
 	#filterInFlightDeliveries(filter?: AsyncJobFilter): AsyncJobDelivery[] {
 		const ownerId = filter?.ownerId;
-		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.isDeliverySuppressed(delivery.jobId));
+		if (!ownerId) return this.#inFlightDeliveries.filter(delivery => !this.#isDeliveryRecordSuppressed(delivery));
 		return this.#inFlightDeliveries.filter(
-			delivery => delivery.ownerId === ownerId && !this.isDeliverySuppressed(delivery.jobId),
+			delivery => delivery.ownerId === ownerId && !this.#isDeliveryRecordSuppressed(delivery),
 		);
 	}
 
@@ -931,7 +1111,7 @@ export class AsyncJobManager {
 			let selected: AsyncJobDelivery | undefined;
 			for (const delivery of this.#deliveries) {
 				if (delivery.ownerId !== filter.ownerId) continue;
-				if (this.isDeliverySuppressed(delivery.jobId)) continue;
+				if (this.#isDeliveryRecordSuppressed(delivery)) continue;
 				if (!selected || delivery.nextAttemptAt < selected.nextAttemptAt) {
 					selected = delivery;
 				}
@@ -954,39 +1134,47 @@ export class AsyncJobManager {
 			if (index === -1) continue;
 			this.#deliveries.splice(index, 1);
 			this.#notifyDeliveryQueueChanged();
-			if (this.isDeliverySuppressed(selected.jobId)) continue;
+			if (this.#isDeliveryRecordSuppressed(selected)) continue;
 
 			return this.#waitForDeliveryPromise(this.#deliverDelivery(selected), deadline);
 		}
 	}
 
 	isDeliverySuppressed(jobId: string): boolean {
-		return this.#suppressedDeliveries.has(jobId) || this.#watchedJobs.has(jobId);
+		if (this.#watchedJobs.has(jobId)) return true;
+		const job = this.#jobs.get(jobId);
+		if (!job) return false;
+		return this.#tempSuppressed.has(job.executionId) || this.#deliveryAcknowledged.has(job.executionId);
+	}
+
+	#isDeliveryRecordSuppressed(delivery: AsyncJobDelivery): boolean {
+		if (this.#watchedJobs.has(delivery.jobId)) return true;
+		return this.#tempSuppressed.has(delivery.executionId) || this.#deliveryAcknowledged.has(delivery.executionId);
 	}
 
 	#enqueueDelivery(jobId: string, text: string): void {
-		// Skip delivery if already acknowledged
-		if (this.isDeliverySuppressed(jobId)) {
-			return;
-		}
 		const job = this.#jobs.get(jobId);
+		if (!job) return;
+		if (this.isDeliverySuppressed(jobId)) return;
 		this.#queueDelivery({
 			jobId,
+			executionId: job.executionId,
 			text,
 			attempt: 0,
 			nextAttemptAt: Date.now(),
-			ownerId: job?.ownerId,
-			jobSnapshot: job
-				? {
-						type: job.type,
-						status: job.status,
-						startTime: job.startTime,
-						label: job.label,
-						structured: job.structured,
-						agentId: job.agentId,
-						latestDetails: job.latestDetails,
-					}
-				: undefined,
+			ownerId: job.ownerId,
+			jobSnapshot: {
+				executionId: job.executionId,
+				type: job.type,
+				status: job.status,
+				startTime: job.startTime,
+				label: job.label,
+				structured: job.structured,
+				agentId: job.agentId,
+				latestDetails: job.latestDetails,
+				resultText: job.resultText,
+				errorText: job.errorText,
+			},
 		});
 		this.#ensureDeliveryLoop();
 	}
@@ -1011,7 +1199,7 @@ export class AsyncJobManager {
 	async #runDeliveryLoop(): Promise<void> {
 		while (this.#deliveries.length > 0) {
 			const delivery = this.#deliveries[0];
-			if (this.isDeliverySuppressed(delivery.jobId)) {
+			if (this.#isDeliveryRecordSuppressed(delivery)) {
 				this.#deliveries.shift();
 				continue;
 			}
@@ -1023,7 +1211,7 @@ export class AsyncJobManager {
 			if (this.#deliveries[0] !== delivery) {
 				continue;
 			}
-			if (this.isDeliverySuppressed(delivery.jobId)) {
+			if (this.#isDeliveryRecordSuppressed(delivery)) {
 				this.#deliveries.shift();
 				continue;
 			}
@@ -1063,17 +1251,21 @@ export class AsyncJobManager {
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
 			try {
-				await sink(
-					delivery.jobId,
-					delivery.text,
-					this.#jobs.get(delivery.jobId) ?? this.#reconstructEvictedJob(delivery),
-				);
-				this.#consumeJobResult(delivery.jobId);
+				if (this.#enrolledAcceptance.has(delivery.executionId)) {
+					const snapshot = this.#snapshotFromDelivery(delivery);
+					if (snapshot) {
+						await this.#persistSnapshots([snapshot]);
+						this.#maybeScheduleEviction(snapshot.jobId);
+					}
+				}
+				if (this.#isDeliveryRecordSuppressed(delivery)) return;
+				await sink(delivery.jobId, delivery.text, this.#resolveDeliveryJob(delivery));
+				this.#consumeExecution(delivery.jobId, delivery.executionId);
 			} catch (error) {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
 				delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
-				if (!this.isDeliverySuppressed(delivery.jobId) && this.#jobs.has(delivery.jobId)) {
+				if (!this.#isDeliveryRecordSuppressed(delivery) && this.#jobs.has(delivery.jobId)) {
 					this.#queueDelivery(delivery);
 				}
 				logger.warn("Async job completion delivery failed", {
@@ -1092,26 +1284,30 @@ export class AsyncJobManager {
 		return promise;
 	}
 
+	#resolveDeliveryJob(delivery: AsyncJobDelivery): AsyncJob | undefined {
+		const current = this.#jobs.get(delivery.jobId);
+		if (current?.executionId === delivery.executionId) return current;
+		return this.#reconstructEvictedJob(delivery);
+	}
+
 	/**
 	 * Rebuild a minimal {@link AsyncJob} from a delivery's enqueue-time
-	 * snapshot when the live job row was already evicted by the time this
-	 * delivery attempt runs (retention elapsed while delivery kept retrying).
-	 * Lets the sink still render `type`/`label`/`structured` instead of
-	 * silently losing them, matching what `job.resultText` would have carried
-	 * had the row survived.
+	 * snapshot when the live job row was already evicted or replaced.
 	 */
 	#reconstructEvictedJob(delivery: AsyncJobDelivery): AsyncJob | undefined {
 		const snapshot = delivery.jobSnapshot;
 		if (!snapshot) return undefined;
 		return {
 			id: delivery.jobId,
+			executionId: snapshot.executionId,
 			type: snapshot.type,
 			status: snapshot.status,
 			startTime: snapshot.startTime,
 			label: snapshot.label,
 			abortController: new AbortController(),
 			promise: Promise.resolve(),
-			resultText: delivery.text,
+			resultText: snapshot.resultText,
+			errorText: snapshot.errorText,
 			structured: snapshot.structured,
 			agentId: snapshot.agentId,
 			latestDetails: snapshot.latestDetails,
@@ -1164,5 +1360,217 @@ export class AsyncJobManager {
 		const backoffMs = DELIVERY_RETRY_BASE_MS * 2 ** exp;
 		const jitterMs = Math.floor(Math.random() * DELIVERY_RETRY_JITTER_MS);
 		return Math.min(DELIVERY_RETRY_MAX_MS, backoffMs + jitterMs);
+	}
+
+	#uniqueJobIds(jobIds: string[]): string[] {
+		return Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+	}
+
+	#allocateExecutionId(): string {
+		return crypto.randomUUID();
+	}
+
+	#mustRetainUnaccepted(job: AsyncJob): boolean {
+		return this.#enrolledAcceptance.has(job.executionId) && !this.#acceptedExecutions.has(job.executionId);
+	}
+
+	#stillCurrent(snapshot: DeliveryAcceptanceSnapshot): boolean {
+		const job = this.#jobs.get(snapshot.jobId);
+		return job?.executionId === snapshot.executionId;
+	}
+
+	#maybeScheduleEviction(jobId: string): void {
+		if (this.#evictionTimers.has(jobId)) return;
+		this.#scheduleEviction(jobId);
+	}
+
+	#dropSuppressedQueuedDeliveries(): void {
+		const before = this.#deliveries.length;
+		this.#deliveries.splice(
+			0,
+			this.#deliveries.length,
+			...this.#deliveries.filter(delivery => !this.#isDeliveryRecordSuppressed(delivery)),
+		);
+		if (before !== this.#deliveries.length) this.#notifyDeliveryQueueChanged();
+	}
+
+	#freezeTree(value: unknown): unknown {
+		if (value === null || typeof value !== "object") return value;
+		if (Array.isArray(value)) {
+			for (const item of value) this.#freezeTree(item);
+		} else {
+			for (const item of Object.values(value)) this.#freezeTree(item);
+		}
+		return Object.freeze(value);
+	}
+
+	#freezeRetained<T>(value: T): T {
+		return this.#freezeTree(structuredClone(value)) as T;
+	}
+
+	#freezeJob(job: AsyncJob): DeliveryAcceptanceSnapshot {
+		return Object.freeze({
+			executionId: job.executionId,
+			jobId: job.id,
+			ownerId: job.ownerId,
+			type: job.type,
+			status: job.status as Exclude<AsyncJob["status"], "running">,
+			label: job.label,
+			resultText: job.resultText,
+			errorText: job.errorText,
+			structured: job.structured === undefined ? undefined : this.#freezeRetained(job.structured),
+			startTime: job.startTime,
+			agentId: job.agentId,
+			latestDetails: job.latestDetails === undefined ? undefined : this.#freezeRetained(job.latestDetails),
+			executionSettled: true as const,
+		});
+	}
+
+	#snapshotSettled(jobIds: string[]): DeliveryAcceptanceSnapshot[] {
+		const snapshots: DeliveryAcceptanceSnapshot[] = [];
+		for (const jobId of this.#uniqueJobIds(jobIds)) {
+			const job = this.#jobs.get(jobId);
+			if (!job || job.status === "running" || !this.#runSettled.has(job.executionId)) continue;
+			if (this.#enrolledAcceptance.has(job.executionId)) {
+				snapshots.push(this.#freezeJob(job));
+				continue;
+			}
+			snapshots.push(
+				Object.freeze({
+					executionId: job.executionId,
+					jobId: job.id,
+					ownerId: job.ownerId,
+					type: job.type,
+					status: job.status as Exclude<AsyncJob["status"], "running">,
+					label: job.label,
+					resultText: job.resultText,
+					errorText: job.errorText,
+					startTime: job.startTime,
+					agentId: job.agentId,
+					executionSettled: true as const,
+				}),
+			);
+		}
+		return snapshots;
+	}
+
+	#snapshotFromDelivery(delivery: AsyncJobDelivery): DeliveryAcceptanceSnapshot | undefined {
+		const job = this.#jobs.get(delivery.jobId);
+		if (job && job.executionId === delivery.executionId) {
+			if (job.status === "running" || !this.#runSettled.has(job.executionId)) return undefined;
+			return this.#freezeJob(job);
+		}
+		const snap = delivery.jobSnapshot;
+		if (!snap || snap.status === "running") return undefined;
+		return Object.freeze({
+			executionId: delivery.executionId,
+			jobId: delivery.jobId,
+			ownerId: delivery.ownerId,
+			type: snap.type,
+			status: snap.status,
+			label: snap.label,
+			resultText: snap.resultText,
+			errorText: snap.errorText,
+			structured: snap.structured === undefined ? undefined : this.#freezeRetained(snap.structured),
+			startTime: snap.startTime,
+			agentId: snap.agentId,
+			latestDetails: snap.latestDetails === undefined ? undefined : this.#freezeRetained(snap.latestDetails),
+			executionSettled: true as const,
+		});
+	}
+
+	/**
+	 * Persist an enrolled cancelled execution after the run callback actually
+	 * finishes. Cancellation stays distinct from model delivery: this does not
+	 * enqueue a sink payload, consume the result, or treat persist failure as
+	 * settlement.
+	 */
+	async #acceptCancelledSettlement(job: AsyncJob): Promise<void> {
+		if (job.status !== "cancelled") return;
+		if (!this.#enrolledAcceptance.has(job.executionId)) return;
+		try {
+			await this.#persistSnapshots([this.#freezeJob(job)]);
+		} catch (error) {
+			logger.warn("Async job cancelled settlement persistence failed", {
+				jobId: job.id,
+				executionId: job.executionId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	async #persistSnapshots(snapshots: DeliveryAcceptanceSnapshot[]): Promise<void> {
+		const pending: DeliveryAcceptanceSnapshot[] = [];
+		const joining: Promise<void>[] = [];
+		for (const snapshot of snapshots) {
+			if (this.#acceptedExecutions.has(snapshot.executionId)) continue;
+			const inflight = this.#persistInFlight.get(snapshot.executionId);
+			if (inflight) joining.push(inflight);
+			else pending.push(snapshot);
+		}
+		if (pending.length === 0) {
+			if (joining.length > 0) await Promise.all(joining);
+			return;
+		}
+		const work = this.#invokeAcceptanceHandlers(pending);
+		for (const snapshot of pending) this.#persistInFlight.set(snapshot.executionId, work);
+		try {
+			await Promise.all([...joining, work]);
+		} finally {
+			for (const snapshot of pending) {
+				if (this.#persistInFlight.get(snapshot.executionId) === work) {
+					this.#persistInFlight.delete(snapshot.executionId);
+				}
+			}
+		}
+	}
+
+	async #invokeAcceptanceHandlers(snapshots: DeliveryAcceptanceSnapshot[]): Promise<void> {
+		const byOwner = new Map<string | undefined, DeliveryAcceptanceSnapshot[]>();
+		for (const snapshot of snapshots) {
+			const boundOwner = this.#enrolledAcceptance.get(snapshot.executionId);
+			const group = byOwner.get(boundOwner);
+			if (group) group.push(snapshot);
+			else byOwner.set(boundOwner, [snapshot]);
+		}
+		for (const [ownerId, group] of byOwner) {
+			if (ownerId === undefined) {
+				for (const snapshot of group) this.#acceptedExecutions.add(snapshot.executionId);
+				continue;
+			}
+			const handler = this.#acceptanceHandlers.get(ownerId);
+			if (!handler) {
+				throw new Error(`Delivery acceptance handler missing for enrolled owner ${ownerId}`);
+			}
+			await handler(Object.freeze(group.slice()));
+			for (const snapshot of group) this.#acceptedExecutions.add(snapshot.executionId);
+		}
+	}
+
+	async #admitRegisteredRun(job: AsyncJob): Promise<boolean> {
+		const ownerId = this.#enrolledAdmission.get(job.executionId);
+		if (ownerId !== undefined) {
+			const handler = this.#admissionHandlers.get(ownerId);
+			if (!handler) {
+				throw new Error(`Job admission handler missing for enrolled owner ${ownerId}`);
+			}
+			await handler(
+				Object.freeze({
+					executionId: job.executionId,
+					jobId: job.id,
+					ownerId: job.ownerId,
+					type: job.type,
+					label: job.label,
+					startTime: job.startTime,
+				}),
+			);
+		}
+		if (!job.abortController.signal.aborted) return true;
+		if (job.status !== "cancelled") job.status = "cancelled";
+		const reason = job.abortController.signal.reason;
+		if (job.errorText === undefined) {
+			job.errorText = reason instanceof Error ? reason.message : reason !== undefined ? String(reason) : "aborted";
+		}
+		return false;
 	}
 }

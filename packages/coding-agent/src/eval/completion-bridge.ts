@@ -27,6 +27,7 @@ import {
 } from "../config/model-resolver";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
+import { completeImplFromEnrollment } from "../session/continuation-complete";
 import { ToolError } from "../tools/tool-errors";
 import type { JsStatusEvent } from "./js/shared/types";
 
@@ -176,7 +177,11 @@ async function executeCompletion(
 			reasoning: reasoningForTier(finalTier, model),
 			toolChoice: schema ? { type: "tool", name: STRUCTURED_TOOL_NAME } : undefined,
 		},
-		{ telemetry, oneshotKind: "eval_completion" },
+		{
+			telemetry,
+			oneshotKind: "eval_completion",
+			completeImpl: completeImplFromEnrollment(session.inferenceStreamFn, session.continuationFactory !== undefined),
+		},
 	);
 
 	if (response.stopReason === "error") {

@@ -530,6 +530,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined> | AfterToolCallResult | undefined;
 	/**
+	 * Fail-closed admission/settlement at actual tool invocation, after argument
+	 * preparation, validation, `beforeToolCall`, and execution context are ready.
+	 * Ordinary sessions omit this and keep the existing path.
+	 *
+	 * Receipt identity stays in the closure that produced the admission; core
+	 * does not persist it. A rejection or settlement failure is a
+	 * {@link ToolExecutionBoundaryError} and is not converted into a tool-error
+	 * result. Not-yet-admitted siblings do not start; already admitted effects
+	 * settle.
+	 */
+	toolExecutionBoundary?: ToolExecutionBoundary;
+	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
 	 * GenAI-semantic-convention spans (`invoke_agent`, `chat`, `execute_tool`)
 	 * using the global tracer provider. Leaving this field undefined disables
@@ -634,6 +646,69 @@ export interface AfterToolCallContext {
 	isError: boolean;
 	/** Current agent context at the time the tool call is finalized. */
 	context: AgentContext;
+}
+
+/**
+ * How an admitted invocation ended.
+ *
+ * - `returned`: `tool.execute` completed and returned, including an explicit
+ *   `isError` result. The owner may durably settle it.
+ * - `threw`: invocation started but threw or aborted before returning. Partial
+ *   effects may exist and must remain unresolved in the owner.
+ * - `not-started`: admission was obtained but `tool.execute` was never called.
+ */
+export type ToolExecutionInvocationOutcome = "returned" | "threw" | "not-started";
+
+/**
+ * Outcome recorded for one admitted tool invocation.
+ * Receipt identity stays in the closure that produced the admission.
+ */
+export interface ToolExecutionSettlement {
+	/** Final result after `afterToolCall`, or the catch/abort placeholder. */
+	result: AgentToolResult<any>;
+	isError: boolean;
+	/** True iff `tool.execute` was entered. Equivalent to `outcome !== "not-started"`. */
+	executed: boolean;
+	outcome: ToolExecutionInvocationOutcome;
+	/**
+	 * The actual `tool.execute` return, captured before `afterToolCall`.
+	 * Present only when `outcome` is `"returned"`. Survives an `afterToolCall`
+	 * failure so the owner does not lose known effects.
+	 */
+	returnedResult?: AgentToolResult<any>;
+}
+
+/**
+ * Handle for one admitted tool invocation. The durable owner retains receipt
+ * identity in this closure; core does not persist it.
+ */
+export interface ToolExecutionAdmission {
+	settle(outcome: ToolExecutionSettlement): Promise<void>;
+}
+
+/**
+ * Fail-closed admission/settlement seam at actual tool execution.
+ */
+export interface ToolExecutionBoundary {
+	admit(context: BeforeToolCallContext, signal?: AbortSignal): Promise<ToolExecutionAdmission>;
+}
+
+/**
+ * Stops the current execution batch, never a model-visible retryable tool error.
+ * Persistence/ownership failures latch until rebind; a semantic admission denial
+ * may stop only this batch so an explicit operator resume can retry admission.
+ */
+export class ToolExecutionBoundaryError extends Error {
+	override readonly name = "ToolExecutionBoundaryError";
+	readonly persistent: boolean;
+	constructor(message = "Tool execution boundary failed", options?: ErrorOptions & { persistent?: boolean }) {
+		super(message, options);
+		this.persistent = options?.persistent ?? true;
+	}
+}
+
+export function isToolExecutionBoundaryError(error: unknown): error is ToolExecutionBoundaryError {
+	return error instanceof ToolExecutionBoundaryError;
 }
 
 /**

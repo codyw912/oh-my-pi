@@ -1,3 +1,4 @@
+import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 
@@ -7,6 +8,8 @@ import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
 import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
+import { completeImplFromStreamFn, rejectEnrolledUnsupportedInference } from "./continuation-complete";
+import { ContinuationRequestBoundaryError } from "./continuation-request";
 
 const CLASSIFIER_SYSTEM_PROMPT = prompt.render(unexpectedStopClassifierPrompt);
 
@@ -38,6 +41,7 @@ export interface ClassifyUnexpectedStopDeps {
 	sessionId: string;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	signal?: AbortSignal;
+	streamFn?: StreamFn;
 }
 
 /** Detects terminal turns eligible for mechanical recovery or smart classification. */
@@ -74,8 +78,8 @@ export async function classifyUnexpectedStop(
 		if (isTinyMemoryLocalModelKey(backend)) {
 			return await classifyLocal(text, backend, deps);
 		}
-		return undefined;
 	} catch (error) {
+		if (error instanceof ContinuationRequestBoundaryError) throw error;
 		logger.debug("unexpected-stop: classification failed", {
 			error: error instanceof Error ? error.message : String(error),
 			backend,
@@ -97,9 +101,10 @@ async function classifyOnline(text: string, deps: ClassifyUnexpectedStopDeps): P
 	const metadata = deps.metadataResolver?.(model.provider);
 	const maxTokens = ONLINE_REASONING_SAFE_MAX_TOKENS;
 
+	const complete = deps.streamFn ? completeImplFromStreamFn(deps.streamFn) : completeSimple;
 	const response = await retryTransientCompletion(
 		() =>
-			completeSimple(
+			complete(
 				model,
 				{
 					systemPrompt: [CLASSIFIER_SYSTEM_PROMPT],
@@ -133,6 +138,10 @@ async function classifyLocal(
 	modelKey: string,
 	deps: ClassifyUnexpectedStopDeps,
 ): Promise<boolean | undefined> {
+	rejectEnrolledUnsupportedInference(
+		deps.streamFn !== undefined,
+		"Continuation HTTP admission is unsupported for local tiny unexpected-stop inference",
+	);
 	if (!isTinyMemoryLocalModelKey(modelKey)) {
 		throw new Error(`unexpected-stop: unsupported local classifier model: ${modelKey}`);
 	}

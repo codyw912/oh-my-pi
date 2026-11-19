@@ -120,6 +120,9 @@ class CloseHoldingStorage implements SessionStorage {
 	drain(): Promise<void> {
 		return this.#inner.drain();
 	}
+	continuationDurability() {
+		return this.#inner.continuationDurability();
+	}
 }
 
 /** Drive microtasks while releasing every parked close until `promise` settles. */

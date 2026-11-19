@@ -21,6 +21,8 @@ export interface IrcBridgeHost {
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
 	runEphemeralTurn(args: { promptText: string }): Promise<{ replyText: string }>;
+	/** Serialize acknowledged inputs across an enrolled session ownership commit. */
+	withInput?<T>(work: () => Promise<T>): Promise<T>;
 }
 
 /** Owns incoming IRC queues, the session's non-interrupting aside queue, injection, and side-channel auto-replies. */
@@ -43,6 +45,15 @@ export class IrcBridge {
 	/** Whether any undelivered IRC record remains queued. */
 	hasPending(): boolean {
 		return this.#interrupts.length > 0 || this.#asides.length > 0;
+	}
+
+	/** Read-only snapshot for a durable continuation input barrier. */
+	peekPending(): AgentMessage[] {
+		return [...this.#interrupts, ...this.#asides];
+	}
+
+	capturePending(): { interrupts: AgentMessage[]; asides: AgentMessage[] } {
+		return { interrupts: [...this.#interrupts], asides: [...this.#asides] };
 	}
 
 	/**
@@ -156,6 +167,10 @@ export class IrcBridge {
 
 	/** Delivers an IRC message into the recipient session without awaiting any wake turn. */
 	async deliver(msg: IrcMessage, opts?: { expectsReply?: boolean }): Promise<"injected" | "woken"> {
+		return this.#host.withInput ? this.#host.withInput(() => this.#deliver(msg, opts)) : this.#deliver(msg, opts);
+	}
+
+	async #deliver(msg: IrcMessage, opts?: { expectsReply?: boolean }): Promise<"injected" | "woken"> {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
 		const streaming = this.#host.isStreaming();
 		const planModeIdle = !streaming && this.#host.planModeEnabled();

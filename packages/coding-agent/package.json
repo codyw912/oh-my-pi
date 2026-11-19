@@ -98,6 +98,7 @@
     "CHANGELOG.md"
   ],
   "exports": {
+    "./session/continuation-request": null,
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"

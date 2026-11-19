@@ -200,14 +200,14 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 	});
 }
 
-export function buildJobResult(
+export async function buildJobResult(
 	session: ToolSession,
 	manager: AsyncJobManager,
 	op: "wait" | "cancel" | "jobs",
 	jobs: TrackedJobLike[],
 	cancelOutcomes: CancelOutcome[],
 	agents: AgentActivitySnapshot[] = [],
-): AgentToolResult<CoordinationDetails> {
+): Promise<AgentToolResult<CoordinationDetails>> {
 	// Deduplicate by id (cancelled jobs may also appear in the watched set).
 	const seen = new Set<string>();
 	const uniqueJobs = jobs.filter(j => {
@@ -218,7 +218,7 @@ export function buildJobResult(
 	const jobResults = snapshotJobs(session, uniqueJobs);
 	const alreadyConsumed = new Set(jobResults.filter(job => manager.isJobResultConsumed(job.id)).map(job => job.id));
 
-	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	await manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -390,7 +390,7 @@ export async function executeCancel(
 				: { id, status: "already_completed", message: `Background job ${id} is already completed.` },
 		);
 	}
-	return buildJobResult(session, manager, "cancel", visibleJobs(manager, ids, ownerId), cancelOutcomes);
+	return await buildJobResult(session, manager, "cancel", visibleJobs(manager, ids, ownerId), cancelOutcomes);
 }
 
 /**
@@ -439,14 +439,14 @@ async function cancelAgentRegistration(
 	return { id, status: "cancelled", message: `Cancelled agent ${id} (killed session, dropped registration).` };
 }
 
-/** `jobs`: read-only snapshot of every job plus the jobless running-agent roster. */
-export function executeJobsSnapshot(
+/** `jobs`: snapshot of every job plus the jobless running-agent roster. Settled results are accepted. */
+export async function executeJobsSnapshot(
 	session: ToolSession,
 	manager: AsyncJobManager,
 	ownerId: string | undefined,
-): AgentToolResult<CoordinationDetails> {
+): Promise<AgentToolResult<CoordinationDetails>> {
 	const jobs = manager.getAllJobs(ownerId ? { ownerId } : undefined);
-	return buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
+	return await buildJobResult(session, manager, "jobs", jobs, [], runningAgentsOutsideJobs(session));
 }
 
 // =============================================================================
